@@ -1,0 +1,12 @@
+[package]
+name = "recordit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+chrono = "0.4.42"
+clap = { version = "4.5.48", features = ["derive"] }
+git2 = { version = "0.20.2", default-features = false }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
