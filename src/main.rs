@@ -1,31 +1,61 @@
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{Context as _, Result, bail};
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 
 mod executor;
 mod recorder;
 
-#[derive(clap::Parser)]
+#[derive(Parser)]
+#[command(author, version, about, propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Record files and run a command.
+    Run(RunArgs),
+    /// Remove recorded sessions.
+    Clean(CleanArgs),
+}
+
+#[derive(clap::Args)]
 #[command(trailing_var_arg = true)]
-pub(crate) struct Args {
+pub(crate) struct RunArgs {
     /// Current working directory. Default to current working directory.
-    #[arg(long, default_value_t = std::env::current_dir().unwrap().to_string_lossy().to_string())]
-    pub(crate) cwd: String,
+    #[arg(long, default_value_os_t = std::env::current_dir().unwrap())]
+    pub(crate) cwd: PathBuf,
     /// Base directory to store recordings. Default to .recordit in the git repository root or current working directory.
-    #[arg(long, default_value_t = String::from(".recordit"))]
-    pub(crate) record_base: String,
+    #[arg(long, default_value_os_t = PathBuf::from(".recordit"))]
+    pub(crate) record_base: PathBuf,
     /// Version name for this recording session. Default to YYYYMMDD-HHMMSS.
     #[arg(short = 'n', long, default_value_t = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string())]
     pub(crate) version_name: String,
     /// Opitonal message for this recording session.
     #[arg(short = 'm', long, default_value_t = String::from(""))]
     pub(crate) message: String,
+    /// Additional files to record besides git tracked files.
+    #[arg(long, value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
+    pub(crate) record: Vec<String>,
     /// Command to execute and record.
     #[arg(required = true)]
     pub(crate) cmd: Vec<String>,
 }
 
+#[derive(clap::Args)]
+pub(crate) struct CleanArgs {
+    /// Current working directory. Default to current working directory.
+    #[arg(long, default_value_os_t = std::env::current_dir().unwrap())]
+    pub(crate) cwd: PathBuf,
+    /// Base directory that stores recordings. Default to .recordit in the git repository root or current working directory.
+    #[arg(long, default_value_os_t = PathBuf::from(".recordit"))]
+    pub(crate) record_base: PathBuf,
+}
+
 pub(crate) struct Context {
-    pub(crate) git_root: Option<String>,
+    pub(crate) git_root: Option<PathBuf>,
+    pub(crate) session_dir: Option<PathBuf>,
 }
 
 fn init_tracing() {
@@ -52,56 +82,159 @@ fn init_tracing() {
         .init();
 }
 
-fn search_record_base(args: &mut Args, context: &mut Context) {
+fn resolve_record_base(cwd: &Path, record_base: &Path, context: &mut Context) -> PathBuf {
     use git2;
-    let repo = git2::Repository::discover(".").ok();
+
+    let repo = git2::Repository::discover(cwd).ok();
+    let mut base_dir = record_base.to_path_buf();
+
     if let Some(repo) = repo {
-        let root = repo.workdir();
-        if let Some(root) = root {
+        if let Some(root) = repo.workdir() {
+            let root = root.to_path_buf();
+            context.git_root = Some(root.clone());
+
+            if !base_dir.is_absolute() {
+                base_dir = root.join(base_dir);
+            }
+
             tracing::info!(
                 "Using git repository root as record base: {}",
-                root.display()
+                base_dir.display()
             );
-            let root = root.to_string_lossy().into_owned();
-            args.record_base = root.clone();
-            context.git_root = Some(root);
         } else {
             tracing::warn!(
                 "Bare repository detected, using current working directory as record base"
             );
+            if !base_dir.is_absolute() {
+                base_dir = cwd.join(base_dir);
+            }
+            tracing::info!("Recording directory resolved to: {}", base_dir.display());
         }
     } else {
+        if !base_dir.is_absolute() {
+            base_dir = cwd.join(base_dir);
+        }
         tracing::info!("Using current working directory as record base");
+        tracing::info!("Recording directory resolved to: {}", base_dir.display());
     }
+
+    base_dir
 }
 
-fn main() -> Result<()> {
-    init_tracing();
+fn ensure_record_base(record_base: &Path) -> Result<()> {
+    if let Ok(exists) = std::fs::exists(record_base) {
+        if !exists {
+            std::fs::create_dir_all(record_base).with_context(|| {
+                format!(
+                    "Failed to create record base directory {}",
+                    record_base.display()
+                )
+            })?;
+            tracing::info!("Created record base directory: {}", record_base.display());
+        }
+    } else {
+        bail!(
+            "Cannot read {}. Check permissions and try again.",
+            record_base.display()
+        );
+    }
 
-    let mut args = Args::parse();
+    Ok(())
+}
 
-    tracing::debug!("cwd: {}", args.cwd);
+fn handle_run(mut args: RunArgs) -> Result<()> {
+    tracing::debug!("cwd: {}", args.cwd.display());
 
     let mut context = Context {
         git_root: None,
+        session_dir: None,
     };
-    search_record_base(&mut args, &mut context);
 
-    tracing::debug!("record_base: {}", args.record_base);
+    let record_base = resolve_record_base(&args.cwd, &args.record_base, &mut context);
+    ensure_record_base(&record_base)?;
+    args.record_base = record_base;
 
-    if let Ok(exists) = std::fs::exists(&args.record_base) {
-        if !exists {
-            std::fs::create_dir_all(&args.record_base).unwrap();
-            tracing::info!("Created record base directory: {}", args.record_base);
-        }
+    tracing::debug!("record_base: {}", args.record_base.display());
+
+    recorder::record_files(&args, &mut context)?;
+
+    if let Some(session_dir) = &context.session_dir {
+        tracing::info!("Recorded files stored at {}", session_dir.display());
     } else {
-        tracing::error!("Cannot read {}.", args.record_base);
-        tracing::error!("Check permissions and try again.");
-        std::process::exit(1);
+        tracing::warn!("Recording completed but session directory was not captured");
     }
 
     tracing::debug!("version name: {}", args.version_name);
     tracing::debug!("commands: {:?}", args.cmd);
 
+    executor::execute_command(&args, &context)?;
+
     Ok(())
+}
+
+fn handle_clean(args: CleanArgs) -> Result<()> {
+    let mut context = Context {
+        git_root: None,
+        session_dir: None,
+    };
+
+    let record_base = resolve_record_base(&args.cwd, &args.record_base, &mut context);
+
+    if !record_base.exists() {
+        tracing::info!(
+            "No recording directory found at {}, nothing to clean",
+            record_base.display()
+        );
+        return Ok(());
+    }
+
+    if !record_base.is_dir() {
+        bail!(
+            "{} exists but is not a directory. Aborting clean.",
+            record_base.display()
+        );
+    }
+
+    let mut removed_entries = 0usize;
+    for entry in std::fs::read_dir(&record_base)
+        .with_context(|| format!("Failed to read {}", record_base.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("Failed to remove directory {}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove file {}", path.display()))?;
+        }
+        removed_entries += 1;
+    }
+
+    if removed_entries == 0 {
+        tracing::info!(
+            "Recording directory {} was already empty",
+            record_base.display()
+        );
+    } else {
+        tracing::info!(
+            "Removed {} entr{} from {}",
+            removed_entries,
+            if removed_entries == 1 { "y" } else { "ies" },
+            record_base.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    init_tracing();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run(args) => handle_run(args),
+        Commands::Clean(args) => handle_clean(args),
+    }
 }
