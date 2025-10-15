@@ -1,6 +1,8 @@
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use tokio::fs as async_fs;
 
 mod executor;
 mod recorder;
@@ -121,28 +123,29 @@ fn resolve_record_base(cwd: &Path, record_base: &Path, context: &mut Context) ->
     base_dir
 }
 
-fn ensure_record_base(record_base: &Path) -> Result<()> {
-    if let Ok(exists) = std::fs::exists(record_base) {
-        if !exists {
-            std::fs::create_dir_all(record_base).with_context(|| {
-                format!(
-                    "Failed to create record base directory {}",
-                    record_base.display()
-                )
-            })?;
+async fn ensure_record_base(record_base: &Path) -> Result<()> {
+    match async_fs::metadata(record_base).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            async_fs::create_dir_all(record_base)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create record base directory {}",
+                        record_base.display()
+                    )
+                })?;
             tracing::info!("Created record base directory: {}", record_base.display());
+            Ok(())
         }
-    } else {
-        bail!(
+        Err(_) => bail!(
             "Cannot read {}. Check permissions and try again.",
             record_base.display()
-        );
+        ),
     }
-
-    Ok(())
 }
 
-fn handle_run(mut args: RunArgs) -> Result<()> {
+async fn handle_run(mut args: RunArgs) -> Result<()> {
     tracing::debug!("cwd: {}", args.cwd.display());
 
     let mut context = Context {
@@ -151,12 +154,12 @@ fn handle_run(mut args: RunArgs) -> Result<()> {
     };
 
     let record_base = resolve_record_base(&args.cwd, &args.record_base, &mut context);
-    ensure_record_base(&record_base)?;
+    ensure_record_base(&record_base).await?;
     args.record_base = record_base;
 
     tracing::debug!("record_base: {}", args.record_base.display());
 
-    recorder::record_files(&args, &mut context)?;
+    recorder::record_files(&args, &mut context).await?;
 
     if let Some(session_dir) = &context.session_dir {
         tracing::info!("Recorded files stored at {}", session_dir.display());
@@ -167,12 +170,12 @@ fn handle_run(mut args: RunArgs) -> Result<()> {
     tracing::debug!("version name: {}", args.version_name);
     tracing::debug!("commands: {:?}", args.cmd);
 
-    executor::execute_command(&args, &context)?;
+    executor::execute_command(&args, &context).await?;
 
     Ok(())
 }
 
-fn handle_clean(args: CleanArgs) -> Result<()> {
+async fn handle_clean(args: CleanArgs) -> Result<()> {
     let mut context = Context {
         git_root: None,
         session_dir: None,
@@ -180,32 +183,46 @@ fn handle_clean(args: CleanArgs) -> Result<()> {
 
     let record_base = resolve_record_base(&args.cwd, &args.record_base, &mut context);
 
-    if !record_base.exists() {
-        tracing::info!(
-            "No recording directory found at {}, nothing to clean",
-            record_base.display()
-        );
-        return Ok(());
-    }
-
-    if !record_base.is_dir() {
-        bail!(
-            "{} exists but is not a directory. Aborting clean.",
-            record_base.display()
-        );
+    match async_fs::metadata(&record_base).await {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                bail!(
+                    "{} exists but is not a directory. Aborting clean.",
+                    record_base.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            tracing::info!(
+                "No recording directory found at {}, nothing to clean",
+                record_base.display()
+            );
+            return Ok(());
+        }
+        Err(err) => bail!("Failed to read {}: {}", record_base.display(), err),
     }
 
     let mut removed_entries = 0usize;
-    for entry in std::fs::read_dir(&record_base)
+    let mut dir = async_fs::read_dir(&record_base)
+        .await
+        .with_context(|| format!("Failed to read {}", record_base.display()))?;
+    while let Some(entry) = dir
+        .next_entry()
+        .await
         .with_context(|| format!("Failed to read {}", record_base.display()))?
     {
-        let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path)
+        let file_type = entry
+            .file_type()
+            .await
+            .with_context(|| format!("Failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            async_fs::remove_dir_all(&path)
+                .await
                 .with_context(|| format!("Failed to remove directory {}", path.display()))?;
         } else {
-            std::fs::remove_file(&path)
+            async_fs::remove_file(&path)
+                .await
                 .with_context(|| format!("Failed to remove file {}", path.display()))?;
         }
         removed_entries += 1;
@@ -228,13 +245,14 @@ fn handle_clean(args: CleanArgs) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run(args) => handle_run(args),
-        Commands::Clean(args) => handle_clean(args),
+        Commands::Run(args) => handle_run(args).await,
+        Commands::Clean(args) => handle_clean(args).await,
     }
 }

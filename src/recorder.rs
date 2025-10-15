@@ -1,25 +1,32 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
+use tokio::fs as async_fs;
+#[cfg(any(unix, windows))]
+use tokio::task::spawn_blocking;
 use tracing::warn;
 
 /// Record specified files into the session directory and store its path inside the context.
-pub fn record_files(args: &crate::RunArgs, context: &mut crate::Context) -> Result<()> {
+pub async fn record_files(args: &crate::RunArgs, context: &mut crate::Context) -> Result<()> {
     let base_dir = args.record_base.clone();
-    let session_dir = prepare_session_directory(&base_dir, &args.version_name, &args.message)?;
+    let session_dir =
+        prepare_session_directory(&base_dir, &args.version_name, &args.message).await?;
     let files_dir = session_dir.join("files");
-    fs::create_dir_all(&files_dir)
+    async_fs::create_dir_all(&files_dir)
+        .await
         .with_context(|| format!("Failed to create files directory {}", files_dir.display()))?;
 
     if !args.message.trim().is_empty() {
-        fs::write(session_dir.join("MESSAGE.txt"), args.message.as_bytes()).with_context(|| {
-            format!(
-                "Failed to write message file under {}",
-                session_dir.display()
-            )
-        })?;
+        async_fs::write(session_dir.join("MESSAGE.txt"), args.message.as_bytes())
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to write message file under {}",
+                    session_dir.display()
+                )
+            })?;
     }
 
     let mut files_to_copy: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
@@ -28,17 +35,17 @@ pub fn record_files(args: &crate::RunArgs, context: &mut crate::Context) -> Resu
         collect_git_tracked_files(git_root, &mut files_to_copy)?;
     }
 
-    collect_explicit_files(args, context, &mut files_to_copy);
+    collect_explicit_files(args, context, &mut files_to_copy).await;
 
     for (relative_destination, source) in &files_to_copy {
         let destination = files_dir.join(relative_destination);
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            async_fs::create_dir_all(parent).await.with_context(|| {
                 format!("Failed to create parent directory {}", parent.display())
             })?;
         }
 
-        copy_entry(source, &destination)?;
+        copy_entry(source, &destination).await?;
     }
 
     context.session_dir = Some(session_dir);
@@ -46,7 +53,11 @@ pub fn record_files(args: &crate::RunArgs, context: &mut crate::Context) -> Resu
     Ok(())
 }
 
-fn prepare_session_directory(base: &Path, version_name: &str, message: &str) -> Result<PathBuf> {
+async fn prepare_session_directory(
+    base: &Path,
+    version_name: &str,
+    message: &str,
+) -> Result<PathBuf> {
     let mut directory_name = sanitize_for_path(version_name)
         .context("Version name cannot be empty after sanitization")?;
     if directory_name == "." || directory_name == ".." {
@@ -59,23 +70,35 @@ fn prepare_session_directory(base: &Path, version_name: &str, message: &str) -> 
     }
 
     let session_dir = base.join(directory_name);
-    if session_dir.exists() {
-        bail!(
-            "Recording directory {} already exists",
-            session_dir.display()
-        );
+    match async_fs::metadata(&session_dir).await {
+        Ok(_) => {
+            bail!(
+                "Recording directory {} already exists",
+                session_dir.display()
+            );
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            async_fs::create_dir_all(&session_dir)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create recording directory {}",
+                        session_dir.display()
+                    )
+                })?;
+        }
+        Err(err) => bail!(
+            "Failed to inspect recording directory {}: {}",
+            session_dir.display(),
+            err
+        ),
     }
-
-    fs::create_dir_all(&session_dir).with_context(|| {
-        format!(
-            "Failed to create recording directory {}",
-            session_dir.display()
-        )
-    })?;
 
     Ok(session_dir)
 }
 
+/// Note: git2 offers blocking APIs only, and at this stage there are no competing async tasks,
+/// so we keep this logic synchronous.
 fn collect_git_tracked_files(
     git_root: &Path,
     files_to_copy: &mut BTreeMap<PathBuf, PathBuf>,
@@ -86,7 +109,7 @@ fn collect_git_tracked_files(
     for entry in index.iter() {
         if let Some(relative_path) = index_entry_path(&entry) {
             let source = git_root.join(&relative_path);
-            let metadata = match fs::symlink_metadata(&source) {
+            let metadata = match std::fs::symlink_metadata(&source) {
                 Ok(metadata) => metadata,
                 Err(err) => {
                     warn!(
@@ -113,7 +136,7 @@ fn collect_git_tracked_files(
     Ok(())
 }
 
-fn collect_explicit_files(
+async fn collect_explicit_files(
     args: &crate::RunArgs,
     context: &crate::Context,
     files_to_copy: &mut BTreeMap<PathBuf, PathBuf>,
@@ -126,7 +149,7 @@ fn collect_explicit_files(
             args.cwd.join(&candidate)
         };
 
-        let metadata = match fs::symlink_metadata(&source) {
+        let metadata = match async_fs::symlink_metadata(&source).await {
             Ok(metadata) => metadata,
             Err(err) => {
                 warn!(
@@ -151,17 +174,18 @@ fn collect_explicit_files(
     }
 }
 
-fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)
+async fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = async_fs::symlink_metadata(source)
+        .await
         .with_context(|| format!("Failed to read metadata for {}", source.display()))?;
 
     if metadata.file_type().is_symlink() {
-        copy_symlink(source, destination)?;
+        copy_symlink(source, destination).await?;
         return Ok(());
     }
 
     if metadata.is_file() {
-        fs::copy(source, destination).with_context(|| {
+        async_fs::copy(source, destination).await.with_context(|| {
             format!(
                 "Failed to copy {} to {}",
                 source.display(),
@@ -177,15 +201,58 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
     );
 }
 
-fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
-    let target = fs::read_link(source)
+async fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    let target = async_fs::read_link(source)
+        .await
         .with_context(|| format!("Failed to read symlink target for {}", source.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
 
-        symlink(&target, destination).with_context(|| {
+        let dest_clone = destination.to_path_buf();
+        let target_clone = target.clone();
+        spawn_blocking(move || symlink(&target_clone, &dest_clone))
+            .await
+            .context("Failed to join symlink creation task")?
+            .with_context(|| {
+                format!(
+                    "Failed to create symlink {} -> {}",
+                    destination.display(),
+                    target.display()
+                )
+            })?;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let mut treat_as_dir = false;
+        if let Ok(meta) = async_fs::metadata(source).await {
+            if meta.is_dir() {
+                treat_as_dir = true;
+            }
+        }
+
+        let dest_clone = destination.to_path_buf();
+        let target_clone = target.clone();
+        spawn_blocking(move || -> std::io::Result<()> {
+            if treat_as_dir {
+                symlink_dir(&target_clone, &dest_clone)
+            } else {
+                match symlink_file(&target_clone, &dest_clone) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == ErrorKind::InvalidInput => {
+                        symlink_dir(&target_clone, &dest_clone)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        })
+        .await
+        .context("Failed to join symlink creation task")?
+        .with_context(|| {
             format!(
                 "Failed to create symlink {} -> {}",
                 destination.display(),
@@ -194,55 +261,17 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
         })?;
     }
 
-    #[cfg(windows)]
-    {
-        use std::io::ErrorKind;
-        use std::os::windows::fs::{symlink_dir, symlink_file};
-
-        if let Ok(meta) = fs::metadata(source) {
-            if meta.is_dir() {
-                symlink_dir(&target, destination).with_context(|| {
-                    format!(
-                        "Failed to create directory symlink {} -> {}",
-                        destination.display(),
-                        target.display()
-                    )
-                })?;
-                return Ok(());
-            }
-        }
-
-        match symlink_file(&target, destination) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::InvalidInput => {
-                symlink_dir(&target, destination).with_context(|| {
-                    format!(
-                        "Failed to create directory symlink {} -> {}",
-                        destination.display(),
-                        target.display()
-                    )
-                })?;
-            }
-            Err(err) => {
-                bail!(
-                    "Failed to create file symlink {} -> {}: {err}",
-                    destination.display(),
-                    target.display()
-                );
-            }
-        }
-    }
-
     #[cfg(not(any(unix, windows)))]
     {
         warn!(
             "Symlink recording is not supported on this platform; writing placeholder for {}",
             destination.display()
         );
-        fs::write(
+        async_fs::write(
             destination,
             format!("recordit_symlink_target: {}\n", target.display()),
         )
+        .await
         .with_context(|| {
             format!(
                 "Failed to serialise symlink {} -> {}",

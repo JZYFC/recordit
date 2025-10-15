@@ -1,22 +1,21 @@
-use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
+use tokio::fs as async_fs;
 use tokio::fs::File as TokioFile;
 use tokio::io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::runtime::Builder;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use toml::value::Table as TomlTable;
 use toml::Value;
+use toml::value::Table as TomlTable;
 use tracing::info;
 
 #[allow(dead_code)]
 /// Execute a command in a subprocess, record and redirect its stdin, stdout, stderr for replay.
-pub fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Result<()> {
+pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Result<()> {
     if args.cmd.is_empty() {
         bail!("No command provided to execute");
     }
@@ -27,7 +26,8 @@ pub fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Resul
         .context("Recording session directory is not available")?;
 
     let io_dir = session_dir.join("io");
-    fs::create_dir_all(&io_dir)
+    async_fs::create_dir_all(&io_dir)
+        .await
         .with_context(|| format!("Failed to create IO directory {}", io_dir.display()))?;
 
     let stdout_log_path = io_dir.join("stdout.log");
@@ -36,68 +36,53 @@ pub fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Resul
 
     info!("Executing command {:?} in {}", args.cmd, args.cwd.display());
 
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create Tokio runtime for executor")?;
+    let mut command = Command::new(&args.cmd[0]);
+    command.args(&args.cmd[1..]);
+    command.current_dir(&args.cwd);
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
 
-    let cmd = args.cmd.clone();
-    let cwd = args.cwd.clone();
-    let stdin_log_path_async = stdin_log_path.clone();
-    let stdout_log_path_async = stdout_log_path.clone();
-    let stderr_log_path_async = stderr_log_path.clone();
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Failed to spawn command {:?}", args.cmd))?;
 
-    let status = runtime.block_on(async move {
-        let mut command = Command::new(&cmd[0]);
-        command.args(&cmd[1..]);
-        command.current_dir(&cwd);
-        command.stdin(std::process::Stdio::piped());
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
+    let shutdown = Arc::new(Notify::new());
 
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("Failed to spawn command {:?}", cmd))?;
+    let stdin_handle = spawn_writer_task(
+        child.stdin.take(),
+        stdin_log_path.clone(),
+        Arc::clone(&shutdown),
+    )?;
+    let stdout_handle = spawn_reader_task(
+        child.stdout.take(),
+        stdout_log_path.clone(),
+        tokio_io::stdout,
+    )?;
+    let stderr_handle = spawn_reader_task(
+        child.stderr.take(),
+        stderr_log_path.clone(),
+        tokio_io::stderr,
+    )?;
 
-        let shutdown = Arc::new(Notify::new());
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("Failed to wait for command {:?}", args.cmd))?;
 
-        let stdin_handle = spawn_writer_task(
-            child.stdin.take(),
-            stdin_log_path_async,
-            Arc::clone(&shutdown),
-        )?;
-        let stdout_handle = spawn_reader_task(
-            child.stdout.take(),
-            stdout_log_path_async,
-            tokio_io::stdout,
-        )?;
-        let stderr_handle = spawn_reader_task(
-            child.stderr.take(),
-            stderr_log_path_async,
-            tokio_io::stderr,
-        )?;
+    shutdown.notify_waiters();
 
-        let status = child
-            .wait()
-            .await
-            .with_context(|| format!("Failed to wait for command {:?}", cmd))?;
+    if let Some(handle) = stdout_handle {
+        join_stream_task(handle).await?;
+    }
 
-        shutdown.notify_waiters();
+    if let Some(handle) = stderr_handle {
+        join_stream_task(handle).await?;
+    }
 
-        if let Some(handle) = stdout_handle {
-            join_stream_task(handle).await?;
-        }
-
-        if let Some(handle) = stderr_handle {
-            join_stream_task(handle).await?;
-        }
-
-        if let Some(handle) = stdin_handle {
-            join_stream_task(handle).await?;
-        }
-
-        Ok::<_, anyhow::Error>(status)
-    })?;
+    if let Some(handle) = stdin_handle {
+        join_stream_task(handle).await?;
+    }
 
     let execution_info = session_dir.join("execution.toml");
 
@@ -131,12 +116,14 @@ pub fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Resul
     let metadata = Value::Table(root);
     let serialized =
         toml::to_string(&metadata).context("Failed to serialise execution metadata to TOML")?;
-    fs::write(&execution_info, serialized).with_context(|| {
-        format!(
-            "Failed to write execution metadata {}",
-            execution_info.display()
-        )
-    })?;
+    async_fs::write(&execution_info, serialized)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to write execution metadata {}",
+                execution_info.display()
+            )
+        })?;
 
     if !status.success() {
         bail!("Command {:?} exited with status {}", args.cmd, status);
@@ -149,7 +136,7 @@ fn spawn_writer_task<W>(
     child_input: Option<W>,
     log_path: PathBuf,
     shutdown: Arc<Notify>,
-) -> Result<Option<JoinHandle<Result<()>>>> 
+) -> Result<Option<JoinHandle<Result<()>>>>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
@@ -160,12 +147,7 @@ where
     let handle = tokio::spawn(async move {
         let mut log_file = TokioFile::create(&log_path)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to create stdin log file {}",
-                    log_path.display()
-                )
-            })?;
+            .with_context(|| format!("Failed to create stdin log file {}", log_path.display()))?;
 
         let mut input = tokio_io::stdin();
         let mut buffer = [0u8; 8192];
@@ -212,7 +194,7 @@ fn spawn_reader_task<R, F, W>(
     reader: Option<R>,
     log_path: PathBuf,
     console_factory: F,
-) -> Result<Option<JoinHandle<Result<()>>>> 
+) -> Result<Option<JoinHandle<Result<()>>>>
 where
     R: AsyncRead + Unpin + Send + 'static,
     F: FnOnce() -> W + Send + 'static,
@@ -225,12 +207,7 @@ where
     let handle = tokio::spawn(async move {
         let mut log_file = TokioFile::create(&log_path)
             .await
-            .with_context(|| {
-                format!(
-                    "Failed to create log file {}",
-                    log_path.display()
-                )
-            })?;
+            .with_context(|| format!("Failed to create log file {}", log_path.display()))?;
         let mut console = console_factory();
         let mut buffer = [0u8; 8192];
 
