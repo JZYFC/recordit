@@ -16,6 +16,17 @@ use tracing::info;
 #[allow(dead_code)]
 /// Execute a command in a subprocess, record and redirect its stdin, stdout, stderr for replay.
 pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Result<()> {
+    execute_command_with_stdin(args, context, tokio_io::stdin()).await
+}
+
+async fn execute_command_with_stdin<R>(
+    args: &crate::RunArgs,
+    context: &crate::Context,
+    stdin_reader: R,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     if args.cmd.is_empty() {
         bail!("No command provided to execute");
     }
@@ -52,6 +63,7 @@ pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) ->
     let stdin_handle = spawn_writer_task(
         child.stdin.take(),
         stdin_log_path.clone(),
+        stdin_reader,
         Arc::clone(&shutdown),
     )?;
     let stdout_handle = spawn_reader_task(
@@ -132,13 +144,15 @@ pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) ->
     Ok(())
 }
 
-fn spawn_writer_task<W>(
+fn spawn_writer_task<W, R>(
     child_input: Option<W>,
     log_path: PathBuf,
+    input: R,
     shutdown: Arc<Notify>,
 ) -> Result<Option<JoinHandle<Result<()>>>>
 where
     W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     let Some(mut child_input) = child_input else {
         return Ok(None);
@@ -149,7 +163,7 @@ where
             .await
             .with_context(|| format!("Failed to create stdin log file {}", log_path.display()))?;
 
-        let mut input = tokio_io::stdin();
+        let mut input = input;
         let mut buffer = [0u8; 8192];
 
         loop {
@@ -261,4 +275,102 @@ fn capture_environment() -> TomlTable {
         env_table.insert(key, Value::String(value));
     }
     env_table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinHandle;
+
+    #[tokio::test]
+    async fn spawn_reader_task_redirects_output() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let log_path = temp.path().join("reader.log");
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (mut console_reader, console_writer) = tokio::io::duplex(64);
+
+        let handle = spawn_reader_task(Some(reader), log_path.clone(), move || console_writer)?
+            .expect("reader handle");
+
+        writer.write_all(b"hello world").await?;
+        writer.shutdown().await?;
+
+        join_stream_task(handle).await?;
+
+        let mut captured = Vec::new();
+        console_reader.read_to_end(&mut captured).await?;
+        assert_eq!(captured, b"hello world");
+
+        let logged = tokio::fs::read(&log_path).await?;
+        assert_eq!(logged, b"hello world");
+        Ok(())
+    }
+
+    #[test]
+    fn capture_environment_includes_set_variables() {
+        unsafe {
+            std::env::set_var("RECORDIT_TEST_ENV", "present");
+        }
+        let env = capture_environment();
+
+        assert_eq!(
+            env.get("RECORDIT_TEST_ENV"),
+            Some(&Value::String("present".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn join_stream_task_propagates_panics() {
+        let handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+            panic!("expected panic");
+        });
+
+        let err = join_stream_task(handle).await.expect_err("should fail");
+        let message = format!("{err}");
+        assert!(message.contains("expected panic"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_command_records_command_output() -> Result<()> {
+        use tokio::fs;
+
+        let temp = TempDir::new().expect("tempdir");
+        let session_dir = temp.path().join("session");
+        let context = crate::Context {
+            git_root: None,
+            session_dir: Some(session_dir.clone()),
+        };
+
+        let args = crate::RunArgs {
+            cwd: temp.path().to_path_buf(),
+            record_base: temp.path().join("records"),
+            version_name: "test".to_string(),
+            message: String::new(),
+            record: Vec::new(),
+            cmd: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf stdout && printf stderr >&2".to_string(),
+            ],
+        };
+
+        super::execute_command_with_stdin(&args, &context, io::empty()).await?;
+
+        let stdout = fs::read(session_dir.join("io").join("stdout.log")).await?;
+        let stderr = fs::read(session_dir.join("io").join("stderr.log")).await?;
+        let stdin = fs::read(session_dir.join("io").join("stdin.log")).await?;
+        let metadata = fs::read_to_string(session_dir.join("execution.toml")).await?;
+
+        assert_eq!(stdout, b"stdout");
+        assert_eq!(stderr, b"stderr");
+        assert!(stdin.is_empty());
+        assert!(metadata.contains("command"));
+        assert!(metadata.contains("cwd"));
+        assert!(metadata.contains("status"));
+        Ok(())
+    }
 }

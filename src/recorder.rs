@@ -381,3 +381,237 @@ fn index_entry_path(entry: &git2::IndexEntry) -> Option<PathBuf> {
         str::from_utf8(&entry.path).ok().map(PathBuf::from)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn new_context() -> crate::Context {
+        crate::Context {
+            git_root: None,
+            session_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_session_directory_creates_unique_directory() -> Result<()> {
+        let base = TempDir::new().expect("tempdir");
+        let session = prepare_session_directory(base.path(), "v1", "My Note").await?;
+
+        assert!(session.exists());
+        let name = session.file_name().unwrap().to_string_lossy();
+        assert!(name.contains("v1"));
+        assert!(name.contains("My_Note"));
+
+        let err = prepare_session_directory(base.path(), "v1", "My Note")
+            .await
+            .expect_err("should conflict");
+        assert!(format!("{err:?}").contains("already exists"));
+        Ok(())
+    }
+
+    #[test]
+    fn collect_git_tracked_files_stages_index_entries() -> Result<()> {
+        let repo_dir = TempDir::new().expect("tempdir");
+        let repo = git2::Repository::init(repo_dir.path())?;
+        let tracked_path = repo_dir.path().join("tracked.txt");
+        std::fs::write(&tracked_path, b"tracked")?;
+
+        let mut index = repo.index()?;
+        index.add_path(Path::new("tracked.txt"))?;
+        index.write()?;
+
+        let mut files = BTreeMap::new();
+        collect_git_tracked_files(repo.workdir().unwrap(), &mut files)?;
+
+        let key = PathBuf::from("tracked.txt");
+        assert_eq!(files.get(&key), Some(&tracked_path));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_explicit_files_honours_relative_and_absolute_paths() -> Result<()> {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().join("workspace");
+        tokio::fs::create_dir_all(&cwd).await?;
+        let relative_file = cwd.join("note.txt");
+        tokio::fs::write(&relative_file, b"hello").await?;
+
+        let external_dir = TempDir::new().expect("external");
+        let external_file = external_dir.path().join("external.txt");
+        tokio::fs::write(&external_file, b"outside").await?;
+
+        let args = crate::RunArgs {
+            cwd: cwd.clone(),
+            record_base: PathBuf::from(".recordit"),
+            version_name: "v1".to_string(),
+            message: String::new(),
+            record: vec![
+                "note.txt".to_string(),
+                external_file.to_string_lossy().to_string(),
+            ],
+            cmd: vec!["echo".to_string()],
+        };
+        let context = new_context();
+        let mut files = BTreeMap::new();
+
+        collect_explicit_files(&args, &context, &mut files).await;
+
+        let expected_relative = PathBuf::from("note.txt");
+        assert_eq!(files.get(&expected_relative), Some(&relative_file));
+
+        let external_key = compute_relative_destination(&external_file, &context, &args);
+        assert_eq!(files.get(&external_key), Some(&external_file));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_entry_copies_regular_files() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        tokio::fs::write(&source, b"contents").await?;
+        let destination = temp.path().join("destination.txt");
+
+        copy_entry(&source, &destination).await?;
+
+        let copied = tokio::fs::read(&destination).await?;
+        assert_eq!(copied, b"contents");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_entry_rejects_directories() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let source_dir = temp.path().join("dir");
+        tokio::fs::create_dir_all(&source_dir).await?;
+        let destination = temp.path().join("destination");
+
+        let err = copy_entry(&source_dir, &destination)
+            .await
+            .expect_err("should fail");
+        assert!(format!("{err}").contains("Unsupported entry type"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_entry_preserves_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("target.txt");
+        tokio::fs::write(&target, b"link target").await?;
+        let source = temp.path().join("source.lnk");
+        symlink(&target, &source).expect("create symlink");
+        let destination = temp.path().join("copied.lnk");
+
+        copy_entry(&source, &destination).await?;
+
+        let copied_target = tokio::fs::read_link(&destination).await?;
+        assert_eq!(copied_target, target);
+        Ok(())
+    }
+
+    #[test]
+    fn compute_relative_destination_prefers_git_root() {
+        let repo_dir = TempDir::new().expect("tempdir");
+        let file = repo_dir.path().join("src").join("main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).expect("create dir");
+        std::fs::write(&file, b"fn main() {}").expect("write file");
+
+        let context = crate::Context {
+            git_root: Some(repo_dir.path().to_path_buf()),
+            session_dir: None,
+        };
+        let args = crate::RunArgs {
+            cwd: repo_dir.path().join("workspace"),
+            record_base: PathBuf::from(".recordit"),
+            version_name: String::new(),
+            message: String::new(),
+            record: Vec::new(),
+            cmd: vec!["echo".to_string()],
+        };
+
+        let relative = compute_relative_destination(&file, &context, &args);
+        assert_eq!(relative, PathBuf::from("src").join("main.rs"));
+    }
+
+    #[test]
+    fn compute_relative_destination_uses_cwd_when_no_git() {
+        let project = TempDir::new().expect("tempdir");
+        let cwd = project.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let file = cwd.join("file.txt");
+        std::fs::write(&file, b"content").expect("write file");
+
+        let context = new_context();
+        let args = crate::RunArgs {
+            cwd: cwd.clone(),
+            record_base: PathBuf::from(".recordit"),
+            version_name: String::new(),
+            message: String::new(),
+            record: Vec::new(),
+            cmd: vec!["echo".to_string()],
+        };
+
+        let relative = compute_relative_destination(&file, &context, &args);
+        assert_eq!(relative, PathBuf::from("file.txt"));
+    }
+
+    #[test]
+    fn sanitize_for_path_discards_empty_names() {
+        assert_eq!(sanitize_for_path("   "), None);
+        assert_eq!(sanitize_for_path("$$"), None);
+        assert_eq!(
+            sanitize_for_path("Hello World"),
+            Some("Hello_World".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn record_files_copies_tracked_and_explicit_files() -> Result<()> {
+        let project = TempDir::new().expect("tempdir");
+        let repo = git2::Repository::init(project.path())?;
+
+        let tracked_path = project.path().join("tracked.txt");
+        tokio::fs::write(&tracked_path, b"tracked").await?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("tracked.txt"))?;
+        index.write()?;
+
+        let extra_path = project.path().join("extra.txt");
+        tokio::fs::write(&extra_path, b"extra").await?;
+
+        let record_base = project.path().join("records");
+        let args = crate::RunArgs {
+            cwd: project.path().to_path_buf(),
+            record_base: record_base.clone(),
+            version_name: "version".to_string(),
+            message: "memo".to_string(),
+            record: vec!["extra.txt".to_string()],
+            cmd: vec!["echo".to_string()],
+        };
+        let mut context = crate::Context {
+            git_root: Some(project.path().to_path_buf()),
+            session_dir: None,
+        };
+
+        record_files(&args, &mut context).await?;
+
+        let session_dir = context
+            .session_dir
+            .as_ref()
+            .expect("session directory should be recorded");
+        let files_dir = session_dir.join("files");
+        let tracked_copy = tokio::fs::read(files_dir.join("tracked.txt")).await?;
+        assert_eq!(tracked_copy, b"tracked");
+        let extra_copy = tokio::fs::read(files_dir.join("extra.txt")).await?;
+        assert_eq!(extra_copy, b"extra");
+        let message = tokio::fs::read_to_string(session_dir.join("MESSAGE.txt")).await?;
+        assert_eq!(message, "memo");
+
+        Ok(())
+    }
+}

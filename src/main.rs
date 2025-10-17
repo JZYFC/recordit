@@ -256,3 +256,117 @@ async fn main() -> Result<()> {
         Commands::Clean(args) => handle_clean(args).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn new_context() -> Context {
+        Context {
+            git_root: None,
+            session_dir: None,
+        }
+    }
+
+    #[test]
+    fn resolve_record_base_prefers_git_root() {
+        let repo_dir = TempDir::new().expect("tempdir");
+        git2::Repository::init(repo_dir.path()).expect("init repo");
+        let cwd = repo_dir.path().join("nested");
+        std::fs::create_dir_all(&cwd).expect("create nested dir");
+
+        let mut context = new_context();
+        let record_base = PathBuf::from("records");
+        let resolved = resolve_record_base(&cwd, &record_base, &mut context);
+
+        assert_eq!(resolved, repo_dir.path().join(&record_base));
+        assert_eq!(
+            context.git_root.as_ref(),
+            Some(&repo_dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_record_base_defaults_to_cwd_without_git() {
+        let cwd_dir = TempDir::new().expect("tempdir");
+        let mut context = new_context();
+        let record_base = PathBuf::from("records");
+
+        let resolved = resolve_record_base(cwd_dir.path(), &record_base, &mut context);
+
+        assert_eq!(resolved, cwd_dir.path().join(&record_base));
+        assert!(context.git_root.is_none());
+    }
+
+    #[test]
+    fn resolve_record_base_respects_absolute_path() {
+        let cwd_dir = TempDir::new().expect("tempdir");
+        git2::Repository::init(cwd_dir.path()).expect("init repo");
+        let absolute = cwd_dir.path().join("absolute");
+        let mut context = new_context();
+
+        let resolved = resolve_record_base(cwd_dir.path(), &absolute, &mut context);
+
+        assert_eq!(resolved, absolute);
+        assert_eq!(
+            context.git_root.as_ref(),
+            Some(&cwd_dir.path().to_path_buf())
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_record_base_creates_directory() -> Result<()> {
+        let temp = TempDir::new().expect("tempdir");
+        let record_base = temp.path().join("record-space");
+
+        ensure_record_base(&record_base).await?;
+        assert!(record_base.is_dir());
+
+        // Calling again should be a no-op and still succeed.
+        ensure_record_base(&record_base).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_clean_removes_contents() -> Result<()> {
+        let project = TempDir::new().expect("tempdir");
+        let record_dir = project.path().join(".recordit");
+        let nested = record_dir.join("nested");
+        tokio::fs::create_dir_all(&nested).await?;
+        tokio::fs::write(record_dir.join("note.txt"), b"hello").await?;
+
+        let args = CleanArgs {
+            cwd: project.path().to_path_buf(),
+            record_base: PathBuf::from(".recordit"),
+        };
+
+        handle_clean(args).await?;
+
+        let mut dir = tokio::fs::read_dir(&record_dir).await?;
+        assert!(
+            dir.next_entry().await?.is_none(),
+            "record directory should be empty"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_clean_is_noop_when_missing() -> Result<()> {
+        let project = TempDir::new().expect("tempdir");
+        let expected = project.path().join("missing");
+        let args = CleanArgs {
+            cwd: project.path().to_path_buf(),
+            record_base: PathBuf::from("missing"),
+        };
+
+        handle_clean(args).await?;
+
+        assert!(
+            !expected.exists(),
+            "clean should not create the recording directory"
+        );
+        Ok(())
+    }
+}
