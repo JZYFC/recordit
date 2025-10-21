@@ -1,5 +1,5 @@
 # 目标目录（可用环境变量覆盖：TARGET_DIR=/mnt/d/... just sync）
-TARGET_DIR := env_var_or_default(""TARGET_DIR", "/mnt/d/Code/Rust/recordit-mirror"/"0
+TARGET_DIR := env_var_or_default("TARGET_DIR", "/mnt/d/Code/Rust/recordit-mirror")
 
 # 使用 bash 并开启严格模式
 set shell := ["bash", "-ueo", "pipefail", "-c"]

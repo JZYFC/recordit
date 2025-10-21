@@ -732,6 +732,7 @@ dependencies = [
  "chrono",
  "clap",
  "git2",
+ "libc",
  "sysinfo",
  "tempfile",
  "tokio",

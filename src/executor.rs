@@ -1,31 +1,51 @@
 use std::ffi::OsString;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{anyhow, Context as _, Result, bail};
 use tokio::fs as async_fs;
 use tokio::fs::File as TokioFile;
 use tokio::io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::process::ChildStdin;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use toml::Value;
 use toml::value::Table as TomlTable;
 use tracing::{info, warn};
 
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
 use sysinfo::{Pid, Process, System};
 
 #[allow(dead_code)]
 /// Execute a command in a subprocess, record and redirect its stdin, stdout, stderr for replay.
 pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Result<()> {
-    execute_command_with_stdin(args, context, tokio_io::stdin()).await
+    execute_command_with_stdin(
+        args,
+        context,
+        StdinInput::<tokio_io::Stdin>::Console,
+    )
+    .await
+}
+
+enum StdinInput<R> {
+    Console,
+    Reader(R),
 }
 
 async fn execute_command_with_stdin<R>(
     args: &crate::RunArgs,
     context: &crate::Context,
-    stdin_reader: R,
+    stdin_input: StdinInput<R>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -84,12 +104,40 @@ where
 
     let shutdown = Arc::new(Notify::new());
 
-    let stdin_handle = spawn_writer_task(
-        child.stdin.take(),
-        stdin_log_path.clone(),
-        stdin_reader,
-        Arc::clone(&shutdown),
-    )?;
+    let stdin_forwarder = match stdin_input {
+        StdinInput::Console => {
+            #[cfg(unix)]
+            {
+                match spawn_reader_thread(child.stdin.take(), stdin_log_path.clone())? {
+                    Some(handle) => StdinForwardHandle::Thread(handle),
+                    None => StdinForwardHandle::None,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                match spawn_writer_task(
+                    child.stdin.take(),
+                    stdin_log_path.clone(),
+                    tokio_io::stdin(),
+                    Arc::clone(&shutdown),
+                )? {
+                    Some(handle) => StdinForwardHandle::Async(handle),
+                    None => StdinForwardHandle::None,
+                }
+            }
+        }
+        StdinInput::Reader(reader) => {
+            match spawn_writer_task(
+                child.stdin.take(),
+                stdin_log_path.clone(),
+                reader,
+                Arc::clone(&shutdown),
+            )? {
+                Some(handle) => StdinForwardHandle::Async(handle),
+                None => StdinForwardHandle::None,
+            }
+        }
+    };
     let stdout_handle = spawn_reader_task(
         child.stdout.take(),
         stdout_log_path.clone(),
@@ -107,6 +155,7 @@ where
         .with_context(|| format!("Failed to wait for command {:?}", args.cmd))?;
 
     shutdown.notify_waiters();
+    stdin_forwarder.signal_shutdown();
 
     if let Some(handle) = stdout_handle {
         join_stream_task(handle).await?;
@@ -116,9 +165,7 @@ where
         join_stream_task(handle).await?;
     }
 
-    if let Some(handle) = stdin_handle {
-        join_stream_task(handle).await?;
-    }
+    stdin_forwarder.finish().await?;
 
     let execution_info = session_dir.join("execution.toml");
 
@@ -607,6 +654,244 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+enum StdinForwardHandle {
+    None,
+    Async(JoinHandle<Result<()>>),
+    #[cfg(unix)]
+    Thread(StdinThreadHandle),
+}
+
+impl StdinForwardHandle {
+    fn signal_shutdown(&self) {
+        match self {
+            StdinForwardHandle::None => {}
+            StdinForwardHandle::Async(_) => {}
+            #[cfg(unix)]
+            StdinForwardHandle::Thread(handle) => handle.signal_shutdown(),
+        }
+    }
+
+    async fn finish(self) -> Result<()> {
+        match self {
+            StdinForwardHandle::None => Ok(()),
+            StdinForwardHandle::Async(handle) => join_stream_task(handle).await,
+            #[cfg(unix)]
+            StdinForwardHandle::Thread(handle) => handle.join().await,
+        }
+    }
+}
+
+#[cfg(unix)]
+struct StdinThreadHandle {
+    shutdown: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Result<()>>,
+}
+
+#[cfg(unix)]
+impl StdinThreadHandle {
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    async fn join(self) -> Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        join_blocking_thread(self.handle).await
+    }
+}
+
+#[cfg(unix)]
+/// Spawn a blocking helper thread for piping interactive terminal input into the child while
+/// logging every chunk that goes through stdin.
+fn spawn_reader_thread(
+    child_input: Option<ChildStdin>,
+    log_path: PathBuf,
+) -> Result<Option<StdinThreadHandle>> {
+    let Some(child_input) = child_input else {
+        return Ok(None);
+    };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = Arc::clone(&shutdown);
+    let handle = std::thread::Builder::new()
+        .name("recordit-stdin".to_string())
+        .spawn(move || run_stdin_forwarder(child_input, log_path, thread_shutdown))
+        .context("Failed to spawn stdin reader thread")?;
+
+    Ok(Some(StdinThreadHandle { shutdown, handle }))
+}
+
+#[cfg(unix)]
+fn run_stdin_forwarder(
+    child_input: ChildStdin,
+    log_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    use anyhow::Context as _;
+
+    let mut log_file = std::fs::File::create(&log_path).with_context(|| {
+        format!("Failed to create stdin log file {}", log_path.display())
+    })?;
+
+    let mut child_file = convert_child_stdin(child_input)
+        .context("Failed to convert child stdin to blocking pipe")?;
+
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let fd_guard = FdFlagGuard::new(fd).context("Failed to configure stdin for non-blocking reads")?;
+    let mut reader = stdin.lock();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                log_file
+                    .write_all(&buffer[..n])
+                    .context("Failed to record stdin chunk")?;
+                log_file.flush().context("Failed to flush stdin log")?;
+
+                match write_child_input(&mut child_file, &buffer[..n]) {
+                    Ok(WriteState::StillOpen) => {}
+                    Ok(WriteState::BrokenPipe) => break,
+                    Err(err) => return Err(err).context("Failed to forward stdin to child"),
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(err) => return Err(err).context("Failed to read from stdin"),
+        }
+    }
+
+    drop(fd_guard);
+    log_file.flush().ok();
+    let _ = child_file.flush();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn convert_child_stdin(child_input: ChildStdin) -> Result<std::fs::File> {
+    use anyhow::Context as _;
+
+    let owned_fd = child_input
+        .into_owned_fd()
+        .context("Failed to obtain owned file descriptor for child stdin")?;
+    let file = std::fs::File::from(owned_fd);
+
+    let fd = file.as_raw_fd();
+    let flags = get_fd_flags(fd)?;
+    set_fd_flags(fd, flags & !libc::O_NONBLOCK)?;
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+enum WriteState {
+    StillOpen,
+    BrokenPipe,
+}
+
+#[cfg(unix)]
+fn write_child_input(file: &mut std::fs::File, mut buf: &[u8]) -> std::io::Result<WriteState> {
+    while !buf.is_empty() {
+        match file.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "Failed to write to child stdin",
+                ));
+            }
+            Ok(written) => {
+                buf = &buf[written..];
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(err) if err.kind() == ErrorKind::BrokenPipe => return Ok(WriteState::BrokenPipe),
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(WriteState::StillOpen)
+}
+
+#[cfg(unix)]
+struct FdFlagGuard {
+    fd: RawFd,
+    original: libc::c_int,
+}
+
+#[cfg(unix)]
+impl FdFlagGuard {
+    fn new(fd: RawFd) -> std::io::Result<Self> {
+        let original = get_fd_flags(fd)?;
+        set_fd_flags(fd, original | libc::O_NONBLOCK)?;
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FdFlagGuard {
+    fn drop(&mut self) {
+        let _ = set_fd_flags(self.fd, self.original);
+    }
+}
+
+#[cfg(unix)]
+fn get_fd_flags(fd: RawFd) -> std::io::Result<libc::c_int> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
+}
+
+#[cfg(unix)]
+fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> std::io::Result<()> {
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn join_blocking_thread(
+    handle: std::thread::JoinHandle<Result<()>>,
+) -> Result<()> {
+    match tokio::task::spawn_blocking(move || handle.join()).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                Err(anyhow!("stdin reader thread panicked: {}", message))
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                Err(anyhow!("stdin reader thread panicked: {}", message))
+            } else {
+                Err(anyhow!("stdin reader thread panicked"))
+            }
+        }
+        Err(join_err) => Err(anyhow!(
+            "stdin reader thread join task failed: {}",
+            join_err
+        )),
+    }
+}
+
+/// Spawn an async task that forwards a non-terminal `AsyncRead` source into the child's stdin while
+/// recording the forwarded bytes.
 fn spawn_writer_task<W, R>(
     child_input: Option<W>,
     log_path: PathBuf,
@@ -667,6 +952,8 @@ where
     Ok(Some(handle))
 }
 
+/// Spawn an async task that relays the child's stdout or stderr to the current console and captures
+/// the same bytes in a log file.
 fn spawn_reader_task<R, F, W>(
     reader: Option<R>,
     log_path: PathBuf,
@@ -821,7 +1108,12 @@ mod tests {
             ],
         };
 
-        super::execute_command_with_stdin(&args, &context, io::empty()).await?;
+        super::execute_command_with_stdin(
+            &args,
+            &context,
+            super::StdinInput::Reader(io::empty()),
+        )
+        .await?;
 
         let stdout = fs::read(session_dir.join("io").join("stdout.log")).await?;
         let stderr = fs::read(session_dir.join("io").join("stderr.log")).await?;
