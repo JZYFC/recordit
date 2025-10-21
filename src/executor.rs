@@ -1,20 +1,47 @@
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 #[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_FAILED, WAIT_OBJECT_0,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, GetFileType,
+    OPEN_EXISTING, ReadFile,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, GetConsoleMode, GetStdHandle,
+    STD_INPUT_HANDLE, SetConsoleMode,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
+};
 
-use anyhow::{anyhow, Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use tokio::fs as async_fs;
 use tokio::fs::File as TokioFile;
 use tokio::io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Command;
 use tokio::process::ChildStdin;
+use tokio::process::Command;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use toml::Value;
@@ -29,12 +56,7 @@ use sysinfo::{Pid, Process, System};
 #[allow(dead_code)]
 /// Execute a command in a subprocess, record and redirect its stdin, stdout, stderr for replay.
 pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Result<()> {
-    execute_command_with_stdin(
-        args,
-        context,
-        StdinInput::<tokio_io::Stdin>::Console,
-    )
-    .await
+    execute_command_with_stdin(args, context, StdinInput::<tokio_io::Stdin>::Console).await
 }
 
 enum StdinInput<R> {
@@ -113,7 +135,26 @@ where
                     None => StdinForwardHandle::None,
                 }
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                if stdin_is_console()? {
+                    match spawn_reader_thread(child.stdin.take(), stdin_log_path.clone())? {
+                        Some(handle) => StdinForwardHandle::Thread(handle),
+                        None => StdinForwardHandle::None,
+                    }
+                } else {
+                    match spawn_writer_task(
+                        child.stdin.take(),
+                        stdin_log_path.clone(),
+                        tokio_io::stdin(),
+                        Arc::clone(&shutdown),
+                    )? {
+                        Some(handle) => StdinForwardHandle::Async(handle),
+                        None => StdinForwardHandle::None,
+                    }
+                }
+            }
+            #[cfg(all(not(unix), not(windows)))]
             {
                 match spawn_writer_task(
                     child.stdin.take(),
@@ -654,11 +695,16 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
+type BlockingStdinThreadHandle = UnixStdinThreadHandle;
+#[cfg(windows)]
+type BlockingStdinThreadHandle = WindowsStdinThreadHandle;
+
 enum StdinForwardHandle {
     None,
     Async(JoinHandle<Result<()>>),
-    #[cfg(unix)]
-    Thread(StdinThreadHandle),
+    #[cfg(any(unix, windows))]
+    Thread(BlockingStdinThreadHandle),
 }
 
 impl StdinForwardHandle {
@@ -666,7 +712,7 @@ impl StdinForwardHandle {
         match self {
             StdinForwardHandle::None => {}
             StdinForwardHandle::Async(_) => {}
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             StdinForwardHandle::Thread(handle) => handle.signal_shutdown(),
         }
     }
@@ -675,20 +721,20 @@ impl StdinForwardHandle {
         match self {
             StdinForwardHandle::None => Ok(()),
             StdinForwardHandle::Async(handle) => join_stream_task(handle).await,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             StdinForwardHandle::Thread(handle) => handle.join().await,
         }
     }
 }
 
 #[cfg(unix)]
-struct StdinThreadHandle {
+struct UnixStdinThreadHandle {
     shutdown: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<Result<()>>,
 }
 
 #[cfg(unix)]
-impl StdinThreadHandle {
+impl UnixStdinThreadHandle {
     fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
     }
@@ -699,13 +745,31 @@ impl StdinThreadHandle {
     }
 }
 
+#[cfg(windows)]
+struct WindowsStdinThreadHandle {
+    shutdown: Arc<WindowsEvent>,
+    handle: std::thread::JoinHandle<Result<()>>,
+}
+
+#[cfg(windows)]
+impl WindowsStdinThreadHandle {
+    fn signal_shutdown(&self) {
+        let _ = self.shutdown.set();
+    }
+
+    async fn join(self) -> Result<()> {
+        let _ = self.shutdown.set();
+        join_blocking_thread(self.handle).await
+    }
+}
+
 #[cfg(unix)]
 /// Spawn a blocking helper thread for piping interactive terminal input into the child while
 /// logging every chunk that goes through stdin.
 fn spawn_reader_thread(
     child_input: Option<ChildStdin>,
     log_path: PathBuf,
-) -> Result<Option<StdinThreadHandle>> {
+) -> Result<Option<UnixStdinThreadHandle>> {
     let Some(child_input) = child_input else {
         return Ok(None);
     };
@@ -714,30 +778,30 @@ fn spawn_reader_thread(
     let thread_shutdown = Arc::clone(&shutdown);
     let handle = std::thread::Builder::new()
         .name("recordit-stdin".to_string())
-        .spawn(move || run_stdin_forwarder(child_input, log_path, thread_shutdown))
+        .spawn(move || run_unix_stdin_forwarder(child_input, log_path, thread_shutdown))
         .context("Failed to spawn stdin reader thread")?;
 
-    Ok(Some(StdinThreadHandle { shutdown, handle }))
+    Ok(Some(UnixStdinThreadHandle { shutdown, handle }))
 }
 
 #[cfg(unix)]
-fn run_stdin_forwarder(
+fn run_unix_stdin_forwarder(
     child_input: ChildStdin,
     log_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     use anyhow::Context as _;
 
-    let mut log_file = std::fs::File::create(&log_path).with_context(|| {
-        format!("Failed to create stdin log file {}", log_path.display())
-    })?;
+    let mut log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("Failed to create stdin log file {}", log_path.display()))?;
 
     let mut child_file = convert_child_stdin(child_input)
         .context("Failed to convert child stdin to blocking pipe")?;
 
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
-    let fd_guard = FdFlagGuard::new(fd).context("Failed to configure stdin for non-blocking reads")?;
+    let fd_guard =
+        FdFlagGuard::new(fd).context("Failed to configure stdin for non-blocking reads")?;
     let mut reader = stdin.lock();
     let mut buffer = [0u8; 8192];
 
@@ -778,6 +842,318 @@ fn run_stdin_forwarder(
     Ok(())
 }
 
+#[cfg(windows)]
+/// Spawn a blocking helper thread that uses Win32 console APIs to relay interactive input into the
+/// child while journaling all bytes that pass through stdin.
+fn spawn_reader_thread(
+    child_input: Option<ChildStdin>,
+    log_path: PathBuf,
+) -> Result<Option<WindowsStdinThreadHandle>> {
+    use anyhow::Context as _;
+
+    let Some(child_input) = child_input else {
+        return Ok(None);
+    };
+
+    let shutdown_event =
+        WindowsEvent::new(true, false).context("Failed to create shutdown event")?;
+    let shutdown = Arc::new(shutdown_event);
+    let thread_shutdown = Arc::clone(&shutdown);
+    let handle = std::thread::Builder::new()
+        .name("recordit-stdin".to_string())
+        .spawn(move || run_windows_stdin_forwarder(child_input, log_path, thread_shutdown))
+        .context("Failed to spawn stdin reader thread")?;
+
+    Ok(Some(WindowsStdinThreadHandle { shutdown, handle }))
+}
+
+#[cfg(windows)]
+fn run_windows_stdin_forwarder(
+    child_input: ChildStdin,
+    log_path: PathBuf,
+    shutdown: Arc<WindowsEvent>,
+) -> Result<()> {
+    use anyhow::Context as _;
+
+    let mut log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("Failed to create stdin log file {}", log_path.display()))?;
+
+    let mut child_file = convert_child_stdin(child_input)
+        .context("Failed to convert child stdin to blocking handle")?;
+
+    let console_input =
+        ConsoleInputHandle::open().context("Failed to open console input handle")?;
+    let std_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if std_handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to acquire standard input handle");
+    }
+    if std_handle == 0 {
+        return Ok(());
+    }
+    let _mode_guard =
+        ConsoleModeGuard::new(std_handle).context("Failed to configure console input mode")?;
+
+    let overlapped_event =
+        WindowsEvent::new(false, false).context("Failed to create overlapped read event")?;
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = overlapped_event.handle();
+
+        let read_result = unsafe {
+            ReadFile(
+                console_input.handle(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+
+        if read_result == 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(code) if code == ERROR_IO_PENDING as i32 => {}
+                Some(code) if code == ERROR_OPERATION_ABORTED as i32 => continue,
+                _ => {
+                    return Err(err).context("Failed to initiate console read");
+                }
+            }
+        }
+
+        let handles = [overlapped_event.handle(), shutdown.handle()];
+        let wait_result = unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, INFINITE)
+        };
+
+        if wait_result == WAIT_OBJECT_0 {
+            let mut bytes_read: u32 = 0;
+            let completed = unsafe {
+                GetOverlappedResult(
+                    console_input.handle(),
+                    &mut overlapped,
+                    &mut bytes_read,
+                    FALSE,
+                )
+            };
+            if completed == 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) {
+                    continue;
+                }
+                return Err(err).context("Failed to complete console read");
+            }
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let chunk = &buffer[..bytes_read as usize];
+            log_file
+                .write_all(chunk)
+                .context("Failed to record stdin chunk")?;
+            log_file.flush().context("Failed to flush stdin log")?;
+
+            match write_child_input(&mut child_file, chunk) {
+                Ok(WriteState::StillOpen) => {}
+                Ok(WriteState::BrokenPipe) => break,
+                Err(err) => return Err(err).context("Failed to forward stdin to child"),
+            }
+        } else if wait_result == WAIT_OBJECT_0 + 1 {
+            unsafe {
+                CancelIoEx(console_input.handle(), &mut overlapped);
+            }
+            let mut _bytes: u32 = 0;
+            unsafe {
+                GetOverlappedResult(console_input.handle(), &mut overlapped, &mut _bytes, FALSE);
+            }
+            break;
+        } else if wait_result == WAIT_FAILED {
+            let err = std::io::Error::last_os_error();
+            return Err(err).context("Waiting on console read failed");
+        } else {
+            continue;
+        }
+    }
+
+    log_file.flush().ok();
+    let _ = child_file.flush();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stdin_is_console() -> Result<bool> {
+    use anyhow::Context as _;
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle == INVALID_HANDLE_VALUE {
+            let err = std::io::Error::last_os_error();
+            return Err(err).context("Failed to acquire standard input handle");
+        }
+        if handle == 0 {
+            return Ok(false);
+        }
+        if GetFileType(handle) != FILE_TYPE_CHAR {
+            return Ok(false);
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(windows)]
+struct ConsoleInputHandle {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl ConsoleInputHandle {
+    fn open() -> std::io::Result<Self> {
+        let name: Vec<u16> = OsStr::new("CONIN$")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self { handle })
+        }
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleInputHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ConsoleModeGuard {
+    handle: HANDLE,
+    original_mode: u32,
+    modified: bool,
+}
+
+#[cfg(windows)]
+impl ConsoleModeGuard {
+    fn new(handle: HANDLE) -> std::io::Result<Self> {
+        let mut original = 0u32;
+        if unsafe { GetConsoleMode(handle, &mut original) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut new_mode = original | ENABLE_EXTENDED_FLAGS;
+        let mut modified = false;
+
+        if original & ENABLE_LINE_INPUT != 0 {
+            new_mode &= !ENABLE_LINE_INPUT;
+            modified = true;
+        }
+
+        if original & ENABLE_ECHO_INPUT != 0 {
+            new_mode &= !ENABLE_ECHO_INPUT;
+            modified = true;
+        }
+
+        if modified {
+            if unsafe { SetConsoleMode(handle, new_mode) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self {
+                handle,
+                original_mode: original,
+                modified: true,
+            })
+        } else {
+            Ok(Self {
+                handle,
+                original_mode: original,
+                modified: false,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleModeGuard {
+    fn drop(&mut self) {
+        if self.modified {
+            unsafe {
+                SetConsoleMode(self.handle, self.original_mode);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsEvent {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl WindowsEvent {
+    fn new(manual_reset: bool, initial_state: bool) -> std::io::Result<Self> {
+        let handle = unsafe {
+            CreateEventW(
+                std::ptr::null_mut(),
+                if manual_reset { 1 } else { 0 },
+                if initial_state { 1 } else { 0 },
+                std::ptr::null(),
+            )
+        };
+        if handle == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self { handle })
+        }
+    }
+
+    fn set(&self) -> std::io::Result<()> {
+        if unsafe { SetEvent(self.handle) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsEvent {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn convert_child_stdin(child_input: ChildStdin) -> Result<std::fs::File> {
     use anyhow::Context as _;
@@ -794,13 +1170,24 @@ fn convert_child_stdin(child_input: ChildStdin) -> Result<std::fs::File> {
     Ok(file)
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn convert_child_stdin(child_input: ChildStdin) -> Result<std::fs::File> {
+    use anyhow::Context as _;
+
+    let owned_handle = child_input
+        .into_owned_handle()
+        .context("Failed to obtain owned handle for child stdin")?;
+
+    Ok(std::fs::File::from(owned_handle))
+}
+
+#[cfg(any(unix, windows))]
 enum WriteState {
     StillOpen,
     BrokenPipe,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn write_child_input(file: &mut std::fs::File, mut buf: &[u8]) -> std::io::Result<WriteState> {
     while !buf.is_empty() {
         match file.write(buf) {
@@ -868,10 +1255,8 @@ fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> std::io::Result<()> {
     }
 }
 
-#[cfg(unix)]
-async fn join_blocking_thread(
-    handle: std::thread::JoinHandle<Result<()>>,
-) -> Result<()> {
+#[cfg(any(unix, windows))]
+async fn join_blocking_thread(handle: std::thread::JoinHandle<Result<()>>) -> Result<()> {
     match tokio::task::spawn_blocking(move || handle.join()).await {
         Ok(Ok(result)) => result,
         Ok(Err(panic)) => {
@@ -1108,12 +1493,8 @@ mod tests {
             ],
         };
 
-        super::execute_command_with_stdin(
-            &args,
-            &context,
-            super::StdinInput::Reader(io::empty()),
-        )
-        .await?;
+        super::execute_command_with_stdin(&args, &context, super::StdinInput::Reader(io::empty()))
+            .await?;
 
         let stdout = fs::read(session_dir.join("io").join("stdout.log")).await?;
         let stderr = fs::read(session_dir.join("io").join("stderr.log")).await?;
