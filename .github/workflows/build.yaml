@@ -13,9 +13,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  metadata:
+    name: Extract crate metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - shell: bash
+        id: metadata
+        run: |
+          echo "CRATE_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')" | tee -a $GITHUB_OUTPUT
+          echo "CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" | tee -a $GITHUB_OUTPUT
+    outputs:
+      name: ${{ steps.metadata.outputs.CRATE_NAME }}
+      version: ${{ steps.metadata.outputs.CRATE_VERSION }}
+  
   build:
     name: Build ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
+    needs: metadata
 
     strategy:
       matrix:
@@ -83,3 +98,53 @@ jobs:
         run: |
           $BUILD_CMD build --target ${{ matrix.job.target }} --release
         
+      - name: Detect release
+        shell: bash
+        id: detect_release
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "is_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_release=false" >> $GITHUB_OUTPUT 
+          fi
+
+      - name: Collect artifact
+        shell: bash
+        id: collect_artifact
+        run: |
+          IS_WINDOWS=false; case ${{ matrix.job.target }} in
+            *-windows-*) IS_WINDOWS=true ;;
+          esac
+
+          BIN_DIR="target/${{ matrix.job.target }}/release"
+          BIN_EXT=""; if [ "$IS_WINDOWS" = "true" ]; then BIN_EXT=".exe"; fi
+
+          ARTIFACT_PATH="${BIN_DIR}/${{ needs.metadata.outputs.name }}${BIN_EXT}"
+          BASE_NAME="${{ needs.metadata.outputs.name }}-${{ needs.metadata.outputs.version }}-${{ matrix.job.target }}"
+          
+          if [ "$IS_WINDOWS" = "true" ]; then
+            ZIP_NAME="${BASE_NAME}.zip"
+            powershell Compress-Archive -Path "$ARTIFACT_PATH" -DestinationPath "$ZIP_NAME"
+            echo "ARTIFACT_FILE=$ZIP_NAME" >> $GITHUB_OUTPUT
+          else
+            TAR_NAME="${BASE_NAME}.tar.gz"
+            tar -czf "$TAR_NAME" -C "$BIN_DIR" "${{ needs.metadata.outputs.name }}"
+            echo "ARTIFACT_FILE=$TAR_NAME" >> $GITHUB_OUTPUT
+          fi
+      
+      # If not release, upload to artifact, retention 7 days
+      - name: Upload artifact
+        if: steps.detect_release.outputs.is_release == 'false'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ needs.metadata.outputs.name }}-${{ matrix.job.target }}-${{ needs.metadata.outputs.version }}
+          path: ${{ steps.collect_artifact.outputs.ARTIFACT_FILE }}
+      
+      # If release, upload to release
+      - name: Upload to release
+        if: steps.detect_release.outputs.is_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.collect_artifact.outputs.ARTIFACT_FILE }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
