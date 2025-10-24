@@ -104,7 +104,7 @@ jobs:
         shell: bash
         id: detect_release
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
+          if [[ $GITHUB_REF =~ ^refs/tags/v ]]; then
             echo "is_release=true" >> $GITHUB_OUTPUT
           else
             echo "is_release=false" >> $GITHUB_OUTPUT 
