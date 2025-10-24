@@ -5,9 +5,8 @@ on:
   push:
     branches: 
       - ci/*
-  release:
-    types:
-      created
+    tags:
+      - 'v*.*.*'
 
 env:
   CARGO_TERM_COLOR: always
