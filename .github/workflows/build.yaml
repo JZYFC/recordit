@@ -125,14 +125,20 @@ jobs:
           ARTIFACT_PATH="${BIN_DIR}/${{ needs.metadata.outputs.name }}${BIN_EXT}"
           BASE_NAME="${{ needs.metadata.outputs.name }}-${{ needs.metadata.outputs.version }}-${{ matrix.job.target }}"
           
-          if [ "$IS_WINDOWS" = "true" ]; then
-            ZIP_NAME="${BASE_NAME}.zip"
-            powershell Compress-Archive -Path "$ARTIFACT_PATH" -DestinationPath "$ZIP_NAME"
-            echo "ARTIFACT_FILE=$ZIP_NAME" >> $GITHUB_OUTPUT
+          if [ "${{ steps.detect_release.outputs.is_release }}" = "true" ]; then
+            # For release, create archive
+            if [ "$IS_WINDOWS" = "true" ]; then
+              ZIP_NAME="${BASE_NAME}.zip"
+              powershell Compress-Archive -Path "$ARTIFACT_PATH" -DestinationPath "$ZIP_NAME"
+              echo "ARTIFACT_FILE=$ZIP_NAME" >> $GITHUB_OUTPUT
+            else
+              TAR_NAME="${BASE_NAME}.tar.gz"
+              tar -czf "$TAR_NAME" -C "$BIN_DIR" "${{ needs.metadata.outputs.name }}"
+              echo "ARTIFACT_FILE=$TAR_NAME" >> $GITHUB_OUTPUT
+            fi
           else
-            TAR_NAME="${BASE_NAME}.tar.gz"
-            tar -czf "$TAR_NAME" -C "$BIN_DIR" "${{ needs.metadata.outputs.name }}"
-            echo "ARTIFACT_FILE=$TAR_NAME" >> $GITHUB_OUTPUT
+            # For non-release, just upload the binary
+            echo "ARTIFACT_FILE=$ARTIFACT_PATH" >> $GITHUB_OUTPUT
           fi
       
       # If not release, upload to artifact, retention 7 days
