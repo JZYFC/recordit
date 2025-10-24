@@ -12,6 +12,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions: 
+  contents: write # create releases
+
 jobs:
   metadata:
     name: Extract crate metadata
@@ -135,10 +138,11 @@ jobs:
       # If not release, upload to artifact, retention 7 days
       - name: Upload artifact
         if: steps.detect_release.outputs.is_release == 'false'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.metadata.outputs.name }}-${{ matrix.job.target }}-${{ needs.metadata.outputs.version }}
           path: ${{ steps.collect_artifact.outputs.ARTIFACT_FILE }}
+          retention-days: 7
       
       # If release, upload to release
       - name: Upload to release
