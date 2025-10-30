@@ -67,7 +67,7 @@ fn init_tracing() {
     #[cfg(debug_assertions)]
     let fmt_layer = fmt::layer().pretty().with_file(true).with_line_number(true);
     #[cfg(not(debug_assertions))]
-    let fmt_layer = fmt::layer().pretty();
+    let fmt_layer = fmt::layer().pretty().with_file(false).with_line_number(false);
 
     #[cfg(debug_assertions)]
     let filter_layer = EnvFilter::try_from_default_env()
@@ -135,6 +135,18 @@ async fn ensure_record_base(record_base: &Path) -> Result<()> {
                         record_base.display()
                     )
                 })?;
+            // Create .gitignore file to ignore all contents including itself
+            let gitignore_path = record_base.join(".gitignore");
+            let gitignore_contents = b"*\n";
+            async_fs::write(&gitignore_path, gitignore_contents)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to create .gitignore in record base directory {}",
+                        record_base.display()
+                    )
+                })?;
+
             tracing::info!("Created record base directory: {}", record_base.display());
             Ok(())
         }
