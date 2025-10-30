@@ -55,10 +55,19 @@ use sysinfo::{Pid, Process, System};
 
 #[allow(dead_code)]
 /// Execute a command in a subprocess, record and redirect its stdin, stdout, stderr for replay.
-pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context, stdin_file: Option<PathBuf>) -> Result<()> {
+pub async fn execute_command(
+    args: &crate::RunArgs,
+    context: &crate::Context,
+    stdin_file: Option<PathBuf>,
+) -> Result<()> {
     if let Some(stdin_path) = stdin_file {
-        assert!(stdin_path.is_file(), "Stdin path not exists or is not a file");
-        let file = TokioFile::open(&stdin_path).await.with_context(|| format!("Failed to open stdin file {}", stdin_path.display()))?;
+        assert!(
+            stdin_path.is_file(),
+            "Stdin path not exists or is not a file"
+        );
+        let file = TokioFile::open(&stdin_path)
+            .await
+            .with_context(|| format!("Failed to open stdin file {}", stdin_path.display()))?;
         execute_command_with_stdin(args, context, StdinInput::Reader(file)).await
     } else {
         execute_command_with_stdin(args, context, StdinInput::<tokio_io::Stdin>::Console).await
@@ -355,13 +364,12 @@ fn shell_from_env(var: &str) -> Result<Option<ShellInfo>> {
     if let Some(name) = Path::new(value.as_os_str())
         .file_name()
         .and_then(|n| n.to_str())
+        && let Some(kind) = classify_shell_name(name)
     {
-        if let Some(kind) = classify_shell_name(name) {
-            return Ok(Some(ShellInfo {
-                program: PathBuf::from(name),
-                kind,
-            }));
-        }
+        return Ok(Some(ShellInfo {
+            program: PathBuf::from(name),
+            kind,
+        }));
     }
 
     warn!(
@@ -376,23 +384,20 @@ fn detect_shell_from_process_tree() -> Option<ShellInfo> {
     let mut current_pid = Pid::from(std::process::id() as usize);
     let mut hops = 0usize;
 
-    loop {
-        let parent_pid = match system
-            .process(current_pid)
-            .and_then(|process| process.parent())
-        {
-            Some(pid) => pid,
-            None => break,
-        };
+    while let Some(pid) = system
+        .process(current_pid)
+        .and_then(|process| process.parent())
+    {
+        let parent_pid = pid;
 
         if system.process(parent_pid).is_none() {
             system.refresh_process(parent_pid);
         }
 
-        if let Some(parent_process) = system.process(parent_pid) {
-            if let Some(shell) = shell_info_from_process(parent_process) {
-                return Some(shell);
-            }
+        if let Some(parent_process) = system.process(parent_pid)
+            && let Some(shell) = shell_info_from_process(parent_process)
+        {
+            return Some(shell);
         }
 
         current_pid = parent_pid;
@@ -408,13 +413,13 @@ fn detect_shell_from_process_tree() -> Option<ShellInfo> {
 }
 
 fn shell_info_from_process(process: &Process) -> Option<ShellInfo> {
-    if let Some(exe) = process.exe() {
-        if let Some(kind) = classify_shell_path(exe) {
-            return Some(ShellInfo {
-                program: exe.to_path_buf(),
-                kind,
-            });
-        }
+    if let Some(exe) = process.exe()
+        && let Some(kind) = classify_shell_path(exe)
+    {
+        return Some(ShellInfo {
+            program: exe.to_path_buf(),
+            kind,
+        });
     }
 
     let name = process.name();
@@ -580,13 +585,13 @@ fn quote_cmd_argument(argument: &str) -> String {
                 backslashes += 1;
             }
             '"' => {
-                quoted.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
                 quoted.push('"');
                 backslashes = 0;
             }
             _ => {
                 if backslashes > 0 {
-                    quoted.extend(std::iter::repeat('\\').take(backslashes));
+                    quoted.extend(std::iter::repeat_n('\\', backslashes));
                     backslashes = 0;
                 }
                 quoted.push(ch);
@@ -595,7 +600,7 @@ fn quote_cmd_argument(argument: &str) -> String {
     }
 
     if backslashes > 0 {
-        quoted.extend(std::iter::repeat('\\').take(backslashes * 2));
+        quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
     }
 
     quoted.push('"');

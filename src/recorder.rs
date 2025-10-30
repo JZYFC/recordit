@@ -289,11 +289,10 @@ fn compute_relative_destination(
     context: &crate::Context,
     args: &crate::RunArgs,
 ) -> PathBuf {
-    if let Some(git_root) = &context.git_root {
-        if let Ok(relative) = source.strip_prefix(git_root) {
+    if let Some(git_root) = &context.git_root
+        && let Ok(relative) = source.strip_prefix(git_root) {
             return relative.to_path_buf();
         }
-    }
 
     let cwd = &args.cwd;
     if let Ok(relative) = source.strip_prefix(cwd) {
@@ -302,11 +301,10 @@ fn compute_relative_destination(
 
     let mut sanitized = PathBuf::from("__external__");
     for component in source.components() {
-        if let Component::Normal(part) = component {
-            if let Some(component) = sanitize_component(part) {
+        if let Component::Normal(part) = component
+            && let Some(component) = sanitize_component(part) {
                 sanitized.push(component);
             }
-        }
     }
 
     if sanitized == Path::new("__external__") {
