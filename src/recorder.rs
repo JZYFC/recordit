@@ -451,6 +451,7 @@ mod tests {
                 "note.txt".to_string(),
                 external_file.to_string_lossy().to_string(),
             ],
+            stdin: None,
             cmd: vec!["echo".to_string()],
         };
         let context = new_context();
@@ -531,6 +532,7 @@ mod tests {
             version_name: String::new(),
             message: String::new(),
             record: Vec::new(),
+            stdin: None,
             cmd: vec!["echo".to_string()],
         };
 
@@ -553,6 +555,7 @@ mod tests {
             version_name: String::new(),
             message: String::new(),
             record: Vec::new(),
+            stdin: None,
             cmd: vec!["echo".to_string()],
         };
 
@@ -591,6 +594,7 @@ mod tests {
             version_name: "version".to_string(),
             message: "memo".to_string(),
             record: vec!["extra.txt".to_string()],
+            stdin: None,
             cmd: vec!["echo".to_string()],
         };
         let mut context = crate::Context {

@@ -55,8 +55,14 @@ use sysinfo::{Pid, Process, System};
 
 #[allow(dead_code)]
 /// Execute a command in a subprocess, record and redirect its stdin, stdout, stderr for replay.
-pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context) -> Result<()> {
-    execute_command_with_stdin(args, context, StdinInput::<tokio_io::Stdin>::Console).await
+pub async fn execute_command(args: &crate::RunArgs, context: &crate::Context, stdin_file: Option<PathBuf>) -> Result<()> {
+    if let Some(stdin_path) = stdin_file {
+        assert!(stdin_path.is_file(), "Stdin path not exists or is not a file");
+        let file = TokioFile::open(&stdin_path).await.with_context(|| format!("Failed to open stdin file {}", stdin_path.display()))?;
+        execute_command_with_stdin(args, context, StdinInput::Reader(file)).await
+    } else {
+        execute_command_with_stdin(args, context, StdinInput::<tokio_io::Stdin>::Console).await
+    }
 }
 
 enum StdinInput<R> {
@@ -1486,6 +1492,7 @@ mod tests {
             version_name: "test".to_string(),
             message: String::new(),
             record: Vec::new(),
+            stdin: None,
             cmd: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),

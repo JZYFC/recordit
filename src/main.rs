@@ -40,6 +40,9 @@ pub(crate) struct RunArgs {
     /// Additional files to record besides git tracked files.
     #[arg(long, value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
     pub(crate) record: Vec<String>,
+    /// Use the file content as command stdin
+    #[arg(long, value_name = "PATH")]
+    pub(crate) stdin: Option<PathBuf>,
     /// Command to execute and record.
     #[arg(required = true)]
     pub(crate) cmd: Vec<String>,
@@ -182,7 +185,15 @@ async fn handle_run(mut args: RunArgs) -> Result<()> {
     tracing::debug!("version name: {}", args.version_name);
     tracing::debug!("commands: {:?}", args.cmd);
 
-    executor::execute_command(&args, &context).await?;
+    if let Some(stdin_path) = &args.stdin {
+        tracing::debug!("Using {} as command stdin", stdin_path.display());
+        // Check file existence
+        if !stdin_path.is_file() {
+            bail!("Stdin file {} does not exist or is not a file", stdin_path.display());
+        }
+    }
+
+    executor::execute_command(&args, &context, args.stdin.clone()).await?;
 
     Ok(())
 }
