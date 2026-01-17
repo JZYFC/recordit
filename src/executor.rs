@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use libc;
 #[cfg(windows)]
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -42,8 +44,10 @@ use tokio::fs::File as TokioFile;
 use tokio::io::{self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::ChildStdin;
 use tokio::process::Command;
+use tokio::signal::ctrl_c;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use toml::Value;
 use toml::value::Table as TomlTable;
 use tracing::{info, warn};
@@ -205,23 +209,59 @@ where
         tokio_io::stderr,
     )?;
 
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("Failed to wait for command {:?}", args.cmd))?;
+    let status = tokio::select! {
+        result = child.wait() => {
+            result.with_context(|| format!("Failed to wait for command {:?}", args.cmd))?
+        }
+        _ = ctrl_c() => {
+            info!("Received Ctrl+C, shutting down gracefully...");
+
+            // Notify input forwarders to stop
+            shutdown.notify_waiters();
+            stdin_forwarder.signal_shutdown();
+
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id() {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = child.kill().await;
+            }
+
+            match timeout(Duration::from_secs(3), child.wait()).await {
+                Ok(result) => result.with_context(|| format!("Failed to wait for command {:?}", args.cmd))?,
+                Err(_) => {
+                    warn!("Child did not exit gracefully within timeout, terminating...");
+                    let _ = child.kill().await;
+                    child.wait().await.with_context(|| format!("Failed to wait for command {:?}", args.cmd))?
+                }
+            }
+        }
+    };
 
     shutdown.notify_waiters();
     stdin_forwarder.signal_shutdown();
 
-    if let Some(handle) = stdout_handle {
-        join_stream_task(handle).await?;
+    if let Some(handle) = stdout_handle
+        && let Err(_) = timeout(Duration::from_secs(5), join_stream_task(handle)).await
+    {
+        warn!("Stdout stream task timed out");
     }
 
-    if let Some(handle) = stderr_handle {
-        join_stream_task(handle).await?;
+    if let Some(handle) = stderr_handle
+        && let Err(_) = timeout(Duration::from_secs(5), join_stream_task(handle)).await
+    {
+        warn!("Stderr stream task timed out");
     }
 
-    stdin_forwarder.finish().await?;
+    if (timeout(Duration::from_secs(5), stdin_forwarder.finish()).await).is_err() {
+        warn!("Stdin forwarder timed out");
+    }
 
     let execution_info = session_dir.join("execution.toml");
 
@@ -942,12 +982,7 @@ fn run_windows_stdin_forwarder(
         if wait_result == WAIT_OBJECT_0 {
             let mut bytes_read: u32 = 0;
             let completed = unsafe {
-                GetOverlappedResult(
-                    console_input.handle(),
-                    &mut overlapped,
-                    &mut bytes_read,
-                    FALSE,
-                )
+                GetOverlappedResult(console_input.handle(), &overlapped, &mut bytes_read, FALSE)
             };
             if completed == 0 {
                 let err = std::io::Error::last_os_error();
@@ -974,11 +1009,11 @@ fn run_windows_stdin_forwarder(
             }
         } else if wait_result == WAIT_OBJECT_0 + 1 {
             unsafe {
-                CancelIoEx(console_input.handle(), &mut overlapped);
+                CancelIoEx(console_input.handle(), &overlapped);
             }
             let mut _bytes: u32 = 0;
             unsafe {
-                GetOverlappedResult(console_input.handle(), &mut overlapped, &mut _bytes, FALSE);
+                GetOverlappedResult(console_input.handle(), &overlapped, &mut _bytes, FALSE);
             }
             break;
         } else if wait_result == WAIT_FAILED {
@@ -1427,7 +1462,7 @@ fn capture_environment() -> TomlTable {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinHandle;
 
     #[tokio::test]

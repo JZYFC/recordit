@@ -229,11 +229,10 @@ async fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
         use std::os::windows::fs::{symlink_dir, symlink_file};
 
         let mut treat_as_dir = false;
-        if let Ok(meta) = async_fs::metadata(source).await {
-            if meta.is_dir() {
+        if let Ok(meta) = async_fs::metadata(source).await
+            && meta.is_dir() {
                 treat_as_dir = true;
             }
-        }
 
         let dest_clone = destination.to_path_buf();
         let target_clone = target.clone();
@@ -290,9 +289,10 @@ fn compute_relative_destination(
     args: &crate::RunArgs,
 ) -> PathBuf {
     if let Some(git_root) = &context.git_root
-        && let Ok(relative) = source.strip_prefix(git_root) {
-            return relative.to_path_buf();
-        }
+        && let Ok(relative) = source.strip_prefix(git_root)
+    {
+        return relative.to_path_buf();
+    }
 
     let cwd = &args.cwd;
     if let Ok(relative) = source.strip_prefix(cwd) {
@@ -302,9 +302,10 @@ fn compute_relative_destination(
     let mut sanitized = PathBuf::from("__external__");
     for component in source.components() {
         if let Component::Normal(part) = component
-            && let Some(component) = sanitize_component(part) {
-                sanitized.push(component);
-            }
+            && let Some(component) = sanitize_component(part)
+        {
+            sanitized.push(component);
+        }
     }
 
     if sanitized == Path::new("__external__") {

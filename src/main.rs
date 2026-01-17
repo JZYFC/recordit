@@ -70,7 +70,10 @@ fn init_tracing() {
     #[cfg(debug_assertions)]
     let fmt_layer = fmt::layer().pretty().with_file(true).with_line_number(true);
     #[cfg(not(debug_assertions))]
-    let fmt_layer = fmt::layer().pretty().with_file(false).with_line_number(false);
+    let fmt_layer = fmt::layer()
+        .pretty()
+        .with_file(false)
+        .with_line_number(false);
 
     #[cfg(debug_assertions)]
     let filter_layer = EnvFilter::try_from_default_env()
@@ -189,7 +192,10 @@ async fn handle_run(mut args: RunArgs) -> Result<()> {
         tracing::debug!("Using {} as command stdin", stdin_path.display());
         // Check file existence
         if !stdin_path.is_file() {
-            bail!("Stdin file {} does not exist or is not a file", stdin_path.display());
+            bail!(
+                "Stdin file {} does not exist or is not a file",
+                stdin_path.display()
+            );
         }
     }
 
