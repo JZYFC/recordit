@@ -230,9 +230,10 @@ async fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
 
         let mut treat_as_dir = false;
         if let Ok(meta) = async_fs::metadata(source).await
-            && meta.is_dir() {
-                treat_as_dir = true;
-            }
+            && meta.is_dir()
+        {
+            treat_as_dir = true;
+        }
 
         let dest_clone = destination.to_path_buf();
         let target_clone = target.clone();
@@ -451,6 +452,7 @@ mod tests {
                 external_file.to_string_lossy().to_string(),
             ],
             stdin: None,
+            use_pty: false,
             cmd: vec!["echo".to_string()],
         };
         let context = new_context();
@@ -532,6 +534,7 @@ mod tests {
             message: String::new(),
             record: Vec::new(),
             stdin: None,
+            use_pty: false,
             cmd: vec!["echo".to_string()],
         };
 
@@ -555,6 +558,7 @@ mod tests {
             message: String::new(),
             record: Vec::new(),
             stdin: None,
+            use_pty: false,
             cmd: vec!["echo".to_string()],
         };
 
@@ -594,6 +598,7 @@ mod tests {
             message: "memo".to_string(),
             record: vec!["extra.txt".to_string()],
             stdin: None,
+            use_pty: false,
             cmd: vec!["echo".to_string()],
         };
         let mut context = crate::Context {

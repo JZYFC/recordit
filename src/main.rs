@@ -43,6 +43,9 @@ pub(crate) struct RunArgs {
     /// Use the file content as command stdin
     #[arg(long, value_name = "PATH")]
     pub(crate) stdin: Option<PathBuf>,
+    /// Use PTY for recording (Windows only).
+    #[arg(long)]
+    pub(crate) use_pty: bool,
     /// Command to execute and record.
     #[arg(required = true)]
     pub(crate) cmd: Vec<String>,
