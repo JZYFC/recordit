@@ -1654,7 +1654,7 @@ fn spawn_unix_pty_process(plan: &UnixPtyExecPlan, cwd: &Path) -> Result<UnixPtyP
         libc::forkpty(
             &mut master_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
             &mut winsize,
         )
     };
