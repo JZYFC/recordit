@@ -2641,6 +2641,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quote_cmd_argument_preserves_trailing_backslashes() {
+        assert_eq!(
+            quote_cmd_argument(r"C:\Program Files\RecordIt\"),
+            r#""C:\Program Files\RecordIt\\""#,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_command_line_preserves_trailing_backslashes() -> Result<()> {
+        let previous_shell = std::env::var_os("RECORDIT_SHELL");
+        unsafe {
+            std::env::set_var("RECORDIT_SHELL", r"C:\Windows\System32\cmd.exe");
+        }
+
+        let result = (|| -> Result<()> {
+            let encoded = build_command_line(&[
+            "echo".to_string(),
+            r"C:\Program Files\RecordIt\".to_string(),
+            ])?;
+            let nul_pos = encoded
+                .iter()
+                .position(|&unit| unit == 0)
+                .expect("nul terminator");
+            let command_line = String::from_utf16(&encoded[..nul_pos]).expect("utf16 command line");
+
+            assert_eq!(
+                command_line,
+                r#"C:\Windows\System32\cmd.exe /c "echo \"C:\Program Files\RecordIt\\\\\"""#,
+            );
+
+            Ok(())
+        })();
+
+        unsafe {
+            if let Some(value) = previous_shell {
+                std::env::set_var("RECORDIT_SHELL", value);
+            } else {
+                std::env::remove_var("RECORDIT_SHELL");
+            }
+        }
+
+        result
+    }
+
     #[tokio::test]
     async fn join_stream_task_propagates_panics() {
         let handle: JoinHandle<Result<()>> = tokio::spawn(async move {
