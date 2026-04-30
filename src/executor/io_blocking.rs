@@ -3,7 +3,7 @@ use std::io::Read;
 use std::io::Write;
 use std::io::ErrorKind;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +70,8 @@ pub(super) fn spawn_reader_thread(
     child_input: Option<ChildStdin>,
     log_path: PathBuf,
 ) -> Result<Option<UnixStdinThreadHandle>> {
+    use anyhow::Context as _;
+
     let Some(child_input) = child_input else {
         return Ok(None);
     };

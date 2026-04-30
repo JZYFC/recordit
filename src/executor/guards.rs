@@ -4,8 +4,6 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
 #[cfg(unix)]
-use std::io::ErrorKind;
-#[cfg(unix)]
 use std::os::unix::io::RawFd;
 
 

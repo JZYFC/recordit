@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
@@ -19,9 +17,11 @@ use tracing::{info, warn};
 use super::shell::prepare_shell_invocation;
 use super::io_async::{spawn_reader_task, spawn_writer_task, join_stream_task};
 #[cfg(unix)]
-use super::io_blocking::{spawn_reader_thread, stdin_is_tty};
+use super::io_blocking::spawn_reader_thread;
 #[cfg(windows)]
 use super::io_blocking::spawn_reader_thread;
+#[cfg(unix)]
+use super::guards::stdin_is_tty;
 #[cfg(windows)]
 use super::guards::stdin_is_console;
 #[cfg(any(unix, windows))]
