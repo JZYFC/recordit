@@ -87,6 +87,15 @@ jobs:
         run: |
           echo "BUILD_CMD=cross" >> $GITHUB_ENV
 
+      - name: Inject tag version into Cargo.toml
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF =~ ^refs/tags/v ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "Setting Cargo.toml version to $VERSION"
+            sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          fi
+
       - name: Show versions
         shell: bash
         run: |
@@ -94,7 +103,7 @@ jobs:
           rustup -V
           rustc -V
           cargo -V
-          
+
       - name: Build release binary
         shell: bash
         run: |
