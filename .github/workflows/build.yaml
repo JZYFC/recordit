@@ -161,7 +161,7 @@ jobs:
       # If release, upload to release
       - name: Upload to release
         if: steps.detect_release.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.collect_artifact.outputs.ARTIFACT_FILE }}
         env:
