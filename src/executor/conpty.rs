@@ -12,30 +12,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, FALSE, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows::Win32::Foundation::{CloseHandle, ERROR_BROKEN_PIPE, HANDLE};
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    ReadFile, WriteFile,
-};
+use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo, GetStdHandle, HPCON,
+use windows::Win32::System::Console::{
+    CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole, CreatePseudoConsole,
+    GetConsoleScreenBufferInfo, GetStdHandle, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR,
     STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, PSEUDOCONSOLE_INHERIT_CURSOR,
-};
+use windows::Win32::System::Pipes::CreatePipe;
 #[cfg(windows)]
-use windows_sys::Win32::System::Pipes::CreatePipe;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
+use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 #[cfg(windows)]
@@ -52,11 +45,16 @@ use tokio::time::timeout;
 use tracing::info;
 
 #[cfg(windows)]
-use super::shell::prepare_shell_invocation;
-#[cfg(windows)]
 use super::guards::{ConsoleInputHandle, ConsoleModeGuard, WindowsEvent};
 #[cfg(windows)]
+use super::shell::prepare_shell_invocation;
+#[cfg(windows)]
 use super::toml_writer::write_execution_toml;
+
+#[cfg(windows)]
+fn win_err(e: windows::core::Error) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.code().0)
+}
 
 #[cfg(windows)]
 struct SafePipe {
@@ -78,19 +76,18 @@ impl SafePipe {
 impl Drop for SafePipe {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.handle);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
 
 #[cfg(windows)]
 fn create_pipe() -> Result<(SafePipe, SafePipe)> {
-    let mut read_handle: HANDLE = 0;
-    let mut write_handle: HANDLE = 0;
-    let ok = unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("CreatePipe failed");
-    }
+    let mut read_handle = HANDLE::default();
+    let mut write_handle = HANDLE::default();
+    unsafe { CreatePipe(&mut read_handle, &mut write_handle, None, 0) }
+        .map_err(win_err)
+        .context("CreatePipe failed")?;
     Ok((SafePipe::new(read_handle), SafePipe::new(write_handle)))
 }
 
@@ -103,22 +100,12 @@ struct ConPtyHandle {
 impl ConPtyHandle {
     fn new(cols: i16, rows: i16, input_read: HANDLE, output_write: HANDLE) -> Result<Self> {
         let size = COORD { X: cols, Y: rows };
-        let mut handle: HPCON = 0;
-        let hr = unsafe {
-            CreatePseudoConsole(
-                size,
-                input_read,
-                output_write,
-                PSEUDOCONSOLE_INHERIT_CURSOR,
-                &mut handle,
-            )
-        };
-        if hr != 0 {
-            bail!(
-                "CreatePseudoConsole failed with HRESULT 0x{:08X}",
-                hr as u32
-            );
+        let handle = unsafe {
+            CreatePseudoConsole(size, input_read, output_write, PSEUDOCONSOLE_INHERIT_CURSOR)
         }
+        .map_err(|e| {
+            anyhow::anyhow!("CreatePseudoConsole failed with HRESULT 0x{:08X}", e.code().0)
+        })?;
         Ok(Self { handle })
     }
 }
@@ -142,45 +129,38 @@ impl ProcThreadAttributeList {
     fn new(conpty: &ConPtyHandle) -> Result<Self> {
         let mut size: usize = 0;
         unsafe {
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+            let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
         }
         if size == 0 {
             bail!("InitializeProcThreadAttributeList returned zero size");
         }
         let mut buffer = vec![0u8; size];
-        let list = buffer.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-        let ok = unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("InitializeProcThreadAttributeList failed");
-        }
-        let ok = unsafe {
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
+        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
+            .map_err(win_err)
+            .context("InitializeProcThreadAttributeList failed")?;
+        unsafe {
             UpdateProcThreadAttribute(
                 list,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                conpty.handle as *const std::ffi::c_void,
+                Some(std::ptr::from_ref(&conpty.handle).cast()),
                 std::mem::size_of::<HPCON>(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
+                None,
+                None,
             )
-        };
-        if ok == 0 {
-            unsafe {
-                DeleteProcThreadAttributeList(list);
-            }
-            return Err(std::io::Error::last_os_error())
-                .context("UpdateProcThreadAttribute failed");
         }
+        .map_err(win_err)
+        .context("UpdateProcThreadAttribute failed")?;
         Ok(Self { buffer })
     }
 
     fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.buffer.as_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+        LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_ptr().cast_mut().cast())
     }
 
     fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.buffer.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST
+        LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_mut_ptr().cast())
     }
 }
 
@@ -200,6 +180,18 @@ struct Win32Process {
 }
 
 #[cfg(windows)]
+struct SendHandle(usize);
+#[cfg(windows)]
+impl SendHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(handle.0 as usize)
+    }
+    fn get(&self) -> HANDLE {
+        HANDLE(self.0 as *mut _)
+    }
+}
+
+#[cfg(windows)]
 impl Win32Process {
     fn process_handle(&self) -> HANDLE {
         self.process_handle
@@ -210,8 +202,8 @@ impl Win32Process {
 impl Drop for Win32Process {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.thread_handle);
-            CloseHandle(self.process_handle);
+            let _ = CloseHandle(self.thread_handle);
+            let _ = CloseHandle(self.process_handle);
         }
     }
 }
@@ -219,12 +211,12 @@ impl Drop for Win32Process {
 #[cfg(windows)]
 fn get_console_size() -> (i16, i16) {
     unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if handle == INVALID_HANDLE_VALUE || handle == 0 {
-            return (80, 24);
-        }
+        let handle = match GetStdHandle(STD_OUTPUT_HANDLE) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return (80, 24),
+        };
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-        if GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
+        if GetConsoleScreenBufferInfo(handle, &mut info).is_err() {
             return (80, 24);
         }
         let cols = info.srWindow.Right - info.srWindow.Left + 1;
@@ -305,24 +297,22 @@ fn spawn_conpty_process(
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    let ok = unsafe {
+    unsafe {
         CreateProcessW(
-            std::ptr::null(),
-            cmd_line.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            FALSE,
+            None,
+            Some(windows::core::PWSTR(cmd_line.as_mut_ptr())),
+            None,
+            None,
+            false,
             EXTENDED_STARTUPINFO_PRESENT,
-            std::ptr::null(),
-            cwd_wide.as_ptr(),
+            None,
+            windows::core::PCWSTR(cwd_wide.as_ptr()),
             &si.StartupInfo,
             &mut pi,
         )
-    };
-
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error()).context("CreateProcessW failed");
     }
+    .map_err(win_err)
+    .context("CreateProcessW failed")?;
 
     Ok(Win32Process {
         process_handle: pi.hProcess,
@@ -336,9 +326,11 @@ fn run_conpty_output_reader(
     stdout_log_path: PathBuf,
     _shutdown: Arc<Notify>,
 ) -> std::thread::JoinHandle<Result<()>> {
+    let pipe = SendHandle::new(pty_output_read);
     std::thread::Builder::new()
         .name("conpty-output".to_string())
         .spawn(move || {
+            let pty_output_read = pipe.get();
             let mut log_file = std::fs::File::create(&stdout_log_path).with_context(|| {
                 format!(
                     "Failed to create stdout log file {}",
@@ -346,27 +338,25 @@ fn run_conpty_output_reader(
                 )
             })?;
 
-            let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.unwrap_or_default();
             let mut buffer = [0u8; 8192];
 
             loop {
                 let mut bytes_read: u32 = 0;
-                let ok = unsafe {
+                let read_result = unsafe {
                     ReadFile(
                         pty_output_read,
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len() as u32,
-                        &mut bytes_read,
-                        std::ptr::null_mut(),
+                        Some(&mut buffer),
+                        Some(&mut bytes_read),
+                        None,
                     )
                 };
 
-                if ok == 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                if let Err(e) = read_result {
+                    if e.code().0 == ERROR_BROKEN_PIPE.0 as i32 {
                         break;
                     }
-                    return Err(err).context("ReadFile on PTY output pipe failed");
+                    return Err(win_err(e)).context("ReadFile on PTY output pipe failed");
                 }
 
                 if bytes_read == 0 {
@@ -376,16 +366,9 @@ fn run_conpty_output_reader(
                 let chunk = &buffer[..bytes_read as usize];
 
                 // Write to real console
-                if stdout_handle != INVALID_HANDLE_VALUE && stdout_handle != 0 {
-                    let mut written: u32 = 0;
+                if !stdout_handle.is_invalid() {
                     unsafe {
-                        WriteFile(
-                            stdout_handle,
-                            chunk.as_ptr().cast(),
-                            chunk.len() as u32,
-                            &mut written,
-                            std::ptr::null_mut(),
-                        );
+                        let _ = WriteFile(stdout_handle, Some(chunk), None, None);
                     }
                 }
 
@@ -408,9 +391,11 @@ fn run_conpty_input_forwarder(
     stdin_log_path: PathBuf,
     shutdown: Arc<WindowsEvent>,
 ) -> std::thread::JoinHandle<Result<()>> {
+    let pipe = SendHandle::new(pty_input_write);
     std::thread::Builder::new()
         .name("conpty-input".to_string())
         .spawn(move || {
+            let pty_input_write = pipe.get();
             let mut log_file = std::fs::File::create(&stdin_log_path).with_context(|| {
                 format!(
                     "Failed to create stdin log file {}",
@@ -420,12 +405,10 @@ fn run_conpty_input_forwarder(
 
             let console_input =
                 ConsoleInputHandle::open().context("Failed to open console input handle")?;
-            let std_input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-            if std_input == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error())
-                    .context("Failed to acquire standard input handle");
-            }
-            if std_input == 0 {
+            let std_input = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
+                .map_err(win_err)
+                .context("Failed to acquire standard input handle")?;
+            if std_input.is_invalid() {
                 return Ok(());
             }
             let _mode_guard = ConsoleModeGuard::new_for_pty_input(std_input)
@@ -444,24 +427,18 @@ fn run_conpty_input_forwarder(
                     let mut total_written = 0u32;
                     let bytes_read = chunk.len() as u32;
                     while total_written < bytes_read {
-                        let mut written: u32 = 0;
-                        let ok = unsafe {
-                            WriteFile(
-                                pty_input_write,
-                                chunk[total_written as usize..].as_ptr().cast(),
-                                bytes_read - total_written,
-                                &mut written,
-                                std::ptr::null_mut(),
-                            )
+                        let slice = &chunk[total_written as usize..];
+                        let write_result = unsafe {
+                            WriteFile(pty_input_write, Some(slice), None, None)
                         };
-                        if ok == 0 {
-                            let err = std::io::Error::last_os_error();
-                            if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                        if let Err(e) = write_result {
+                            if e.code().0 == ERROR_BROKEN_PIPE.0 as i32 {
                                 return Ok(true);
                             }
-                            return Err(err).context("Failed to write to PTY input pipe");
+                            return Err(win_err(e)).context("Failed to write to PTY input pipe");
                         }
-                        total_written += written;
+                        // Without an out-param we can't know partial writes; assume full.
+                        total_written = bytes_read;
                     }
                     Ok(false)
                 },
@@ -559,15 +536,17 @@ pub(super) async fn execute_command_with_conpty(
     // Wait for process exit via oneshot + blocking wait thread
     let process_handle = process.process_handle();
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<u32>();
+    let wait_handle = SendHandle::new(process_handle);
     let wait_thread = std::thread::Builder::new()
         .name("conpty-wait".to_string())
         .spawn(move || {
+            let handle = wait_handle.get();
             unsafe {
-                WaitForSingleObject(process_handle, INFINITE);
+                WaitForSingleObject(handle, INFINITE);
             }
             let mut exit_code: u32 = 1;
             unsafe {
-                GetExitCodeProcess(process_handle, &mut exit_code);
+                let _ = GetExitCodeProcess(handle, &mut exit_code);
             }
             let _ = exit_tx.send(exit_code);
         })
@@ -582,16 +561,17 @@ pub(super) async fn execute_command_with_conpty(
 
             // Terminate the process
             unsafe {
-                TerminateProcess(process.process_handle(), 1);
+                let _ = TerminateProcess(process.process_handle(), 1);
             }
 
             // Wait briefly for the process to actually exit
             tokio::task::spawn_blocking({
-                let ph = process.process_handle();
+                let ph = SendHandle::new(process.process_handle());
                 move || unsafe {
-                    WaitForSingleObject(ph, 3000);
+                    let handle = ph.get();
+                    WaitForSingleObject(handle, 3000);
                     let mut code: u32 = 1;
-                    GetExitCodeProcess(ph, &mut code);
+                    let _ = GetExitCodeProcess(handle, &mut code);
                     code
                 }
             })

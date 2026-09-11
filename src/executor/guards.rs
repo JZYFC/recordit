@@ -6,29 +6,37 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
 
-
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
 };
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
+use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, GetFileType,
     OPEN_EXISTING, ReadFile,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, GetConsoleMode,
-    GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE,
+use windows::Win32::System::Console::{
+    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, GetConsoleMode,
+    GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForMultipleObjects, INFINITE,
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
+
+#[cfg(windows)]
+fn last_os_error() -> std::io::Error {
+    std::io::Error::last_os_error()
+}
+
+#[cfg(windows)]
+fn win_err(e: windows::core::Error) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.code().0)
+}
 
 #[cfg(windows)]
 pub(super) struct ConsoleInputHandle {
@@ -44,20 +52,17 @@ impl ConsoleInputHandle {
             .collect();
         let handle = unsafe {
             CreateFileW(
-                name.as_ptr(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                windows::core::PCWSTR(name.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null_mut(),
+                None,
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-                0,
+                None,
             )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(Self { handle })
         }
+        .map_err(win_err)?;
+        Ok(Self { handle })
     }
 
     pub(super) fn handle(&self) -> HANDLE {
@@ -69,7 +74,7 @@ impl ConsoleInputHandle {
 impl Drop for ConsoleInputHandle {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.handle);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -77,7 +82,7 @@ impl Drop for ConsoleInputHandle {
 #[cfg(windows)]
 pub(super) struct ConsoleModeGuard {
     handle: HANDLE,
-    original_mode: u32,
+    original_mode: CONSOLE_MODE,
     modified: bool,
 }
 
@@ -96,28 +101,24 @@ impl ConsoleModeGuard {
         disable_echo: bool,
         disable_line_input: bool,
     ) -> std::io::Result<Self> {
-        let mut original = 0u32;
-        if unsafe { GetConsoleMode(handle, &mut original) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let mut original = CONSOLE_MODE(0);
+        unsafe { GetConsoleMode(handle, &mut original) }.map_err(win_err)?;
 
-        let mut new_mode = original | ENABLE_EXTENDED_FLAGS;
+        let mut new_mode = CONSOLE_MODE(original.0 | ENABLE_EXTENDED_FLAGS.0);
         let mut modified = new_mode != original;
 
-        if disable_line_input && (new_mode & ENABLE_LINE_INPUT) != 0 {
-            new_mode &= !ENABLE_LINE_INPUT;
+        if disable_line_input && (new_mode.0 & ENABLE_LINE_INPUT.0) != 0 {
+            new_mode = CONSOLE_MODE(new_mode.0 & !ENABLE_LINE_INPUT.0);
             modified = true;
         }
 
-        if disable_echo && (new_mode & ENABLE_ECHO_INPUT) != 0 {
-            new_mode &= !ENABLE_ECHO_INPUT;
+        if disable_echo && (new_mode.0 & ENABLE_ECHO_INPUT.0) != 0 {
+            new_mode = CONSOLE_MODE(new_mode.0 & !ENABLE_ECHO_INPUT.0);
             modified = true;
         }
 
         if modified {
-            if unsafe { SetConsoleMode(handle, new_mode) } == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            unsafe { SetConsoleMode(handle, new_mode) }.map_err(win_err)?;
             Ok(Self {
                 handle,
                 original_mode: original,
@@ -138,7 +139,7 @@ impl Drop for ConsoleModeGuard {
     fn drop(&mut self) {
         if self.modified {
             unsafe {
-                SetConsoleMode(self.handle, self.original_mode);
+                let _ = SetConsoleMode(self.handle, self.original_mode);
             }
         }
     }
@@ -149,30 +150,22 @@ pub(super) struct WindowsEvent {
     handle: HANDLE,
 }
 
+// SAFETY: HANDLE wraps an OS handle value that is safe to move across threads.
+#[cfg(windows)]
+unsafe impl Send for WindowsEvent {}
+#[cfg(windows)]
+unsafe impl Sync for WindowsEvent {}
+
 #[cfg(windows)]
 impl WindowsEvent {
     pub(super) fn new(manual_reset: bool, initial_state: bool) -> std::io::Result<Self> {
-        let handle = unsafe {
-            CreateEventW(
-                std::ptr::null_mut(),
-                if manual_reset { 1 } else { 0 },
-                if initial_state { 1 } else { 0 },
-                std::ptr::null(),
-            )
-        };
-        if handle == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(Self { handle })
-        }
+        let handle = unsafe { CreateEventW(None, manual_reset, initial_state, None) }
+            .map_err(win_err)?;
+        Ok(Self { handle })
     }
 
     pub(super) fn set(&self) -> std::io::Result<()> {
-        if unsafe { SetEvent(self.handle) } == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        unsafe { SetEvent(self.handle) }.map_err(win_err)
     }
 
     pub(super) fn handle(&self) -> HANDLE {
@@ -184,7 +177,7 @@ impl WindowsEvent {
 impl Drop for WindowsEvent {
     fn drop(&mut self) {
         unsafe {
-            CloseHandle(self.handle);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -278,22 +271,16 @@ pub(super) fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> std::io::Result<()>
 
 #[cfg(windows)]
 pub(super) fn stdin_is_console() -> Result<bool, anyhow::Error> {
-    use anyhow::Context as _;
-
     unsafe {
-        let handle = GetStdHandle(STD_INPUT_HANDLE);
-        if handle == INVALID_HANDLE_VALUE {
-            let err = std::io::Error::last_os_error();
-            return Err(err).context("Failed to acquire standard input handle");
-        }
-        if handle == 0 {
+        let handle = GetStdHandle(STD_INPUT_HANDLE).map_err(win_err)?;
+        if handle.is_invalid() {
             return Ok(false);
         }
         if GetFileType(handle) != FILE_TYPE_CHAR {
             return Ok(false);
         }
-        let mut mode = 0u32;
-        if GetConsoleMode(handle, &mut mode) == 0 {
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(handle, &mut mode).is_err() {
             return Ok(false);
         }
         Ok(true)
@@ -324,40 +311,35 @@ pub(super) fn console_io_read_loop(
         let read_result = unsafe {
             ReadFile(
                 console_handle,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-                std::ptr::null_mut(),
-                &mut overlapped,
+                Some(&mut buffer),
+                None,
+                Some(&mut overlapped),
             )
         };
 
-        if read_result == 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(code) if code == ERROR_IO_PENDING as i32 => {}
-                Some(code) if code == ERROR_OPERATION_ABORTED as i32 => continue,
+        if let Err(e) = read_result {
+            match e.code().0 {
+                code if code == ERROR_IO_PENDING.0 as i32 => {}
+                code if code == ERROR_OPERATION_ABORTED.0 as i32 => continue,
                 _ => {
-                    return Err(err).context("Failed to initiate console read");
+                    return Err(win_err(e)).context("Failed to initiate console read");
                 }
             }
         }
 
         let handles = [overlapped_event.handle(), shutdown.handle()];
-        let wait_result = unsafe {
-            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, INFINITE)
-        };
+        let wait_result = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
 
         if wait_result == WAIT_OBJECT_0 {
             let mut bytes_read: u32 = 0;
             let completed = unsafe {
-                GetOverlappedResult(console_handle, &overlapped, &mut bytes_read, FALSE)
+                GetOverlappedResult(console_handle, &overlapped, &mut bytes_read, false)
             };
-            if completed == 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) {
+            if let Err(e) = completed {
+                if e.code().0 == ERROR_OPERATION_ABORTED.0 as i32 {
                     continue;
                 }
-                return Err(err).context("Failed to complete console read");
+                return Err(win_err(e)).context("Failed to complete console read");
             }
 
             if bytes_read == 0 {
@@ -365,23 +347,22 @@ pub(super) fn console_io_read_loop(
             }
 
             let chunk = &buffer[..bytes_read as usize];
-            let should_break = write_chunk(chunk)
-                .context("Failed to process console input chunk")?;
+            let should_break =
+                write_chunk(chunk).context("Failed to process console input chunk")?;
             if should_break {
                 break;
             }
-        } else if wait_result == WAIT_OBJECT_0 + 1 {
+        } else if wait_result.0 == WAIT_OBJECT_0.0 + 1 {
             unsafe {
-                CancelIoEx(console_handle, &overlapped);
+                let _ = CancelIoEx(console_handle, Some(&overlapped));
             }
             let mut _bytes: u32 = 0;
             unsafe {
-                GetOverlappedResult(console_handle, &overlapped, &mut _bytes, FALSE);
+                let _ = GetOverlappedResult(console_handle, &overlapped, &mut _bytes, false);
             }
             break;
         } else if wait_result == WAIT_FAILED {
-            let err = std::io::Error::last_os_error();
-            return Err(err).context("Waiting on console read failed");
+            return Err(last_os_error()).context("Waiting on console read failed");
         } else {
             continue;
         }

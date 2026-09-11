@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-#[cfg(windows)]
-use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+use windows::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
 
 use anyhow::Result;
 use tokio::process::ChildStdin;
@@ -183,12 +181,10 @@ fn run_windows_stdin_forwarder(
 
     let console_input =
         ConsoleInputHandle::open().context("Failed to open console input handle")?;
-    let std_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if std_handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error())
-            .context("Failed to acquire standard input handle");
-    }
-    if std_handle == 0 {
+    let std_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))
+        .context("Failed to acquire standard input handle")?;
+    if std_handle.is_invalid() {
         return Ok(());
     }
     let _mode_guard =

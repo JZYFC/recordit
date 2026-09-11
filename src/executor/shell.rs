@@ -126,7 +126,10 @@ fn detect_shell_from_process_tree() -> Option<ShellInfo> {
         let parent_pid = pid;
 
         if system.process(parent_pid).is_none() {
-            system.refresh_process(parent_pid);
+            system.refresh_processes(
+                sysinfo::ProcessesToUpdate::Some(&[parent_pid]),
+                false,
+            );
         }
 
         if let Some(parent_process) = system.process(parent_pid)
@@ -157,9 +160,9 @@ fn shell_info_from_process(process: &Process) -> Option<ShellInfo> {
         });
     }
 
-    let name = process.name();
-    classify_shell_name(name).map(|kind| ShellInfo {
-        program: PathBuf::from(name),
+    let name = process.name().to_string_lossy();
+    classify_shell_name(&name).map(|kind| ShellInfo {
+        program: PathBuf::from(name.as_ref()),
         kind,
     })
 }
