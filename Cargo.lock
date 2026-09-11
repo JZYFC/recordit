@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "recordit"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -799,6 +799,8 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
  "windows",
 ]
 

@@ -15,7 +15,7 @@ pub(crate) fn capture_environment() -> TomlTable {
     env_table
 }
 
-pub(super) async fn write_execution_toml(
+pub(crate) async fn write_execution_toml(
     session_dir: &Path,
     args: &crate::RunArgs,
     success: bool,

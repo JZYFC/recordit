@@ -10,5 +10,7 @@ mod toml_writer;
 #[cfg(test)]
 mod tests;
 
-// Only re-export what main.rs needs
+// Re-export for main and the TUI runner.
 pub(crate) use execution::execute_command;
+pub(crate) use shell::prepare_shell_invocation;
+pub(crate) use toml_writer::write_execution_toml;

@@ -1,6 +1,6 @@
 [package]
 name = "recordit"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,8 @@ tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "proce
 sysinfo = "0.39"
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-segmentation = "1.13"
+unicode-width = "=0.2.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

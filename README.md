@@ -112,7 +112,47 @@ recordit tui [--cwd <path>] [--record-base <path>]
 Opens an interactive terminal UI for browsing recorded sessions. The left pane
 lists sessions (newest first) with status and command; the right pane shows
 overview metadata plus recorded files, stdout, stderr, and stdin. Use `j`/`k`
-to move, `Tab` to switch panes, `1`-`5` to jump to a tab, and `q` to quit.
+to move, `Tab`/`Shift-Tab` (or `1`-`5`) to switch panes, `←`/`→` to pan the
+detail body horizontally, and `q` to quit.
+
+Press `R` to open a command prompt and launch a live monitored run without
+leaving the browser flow. After the run finishes you return to the browser.
+On Windows, backslashes in the command prompt are literal path separators;
+quote paths containing spaces.
+
+### `recordit tui run`
+
+```
+recordit tui run [OPTIONS] -- <command> [args...]
+```
+
+Same options as `recordit run`, but opens a live monitor TUI instead of
+streaming straight to your terminal:
+
+- Left column: recorded files, environment variables, and an interactive stdin
+  panel (`i` or `Enter` to type, `Esc` to leave).
+- Middle column: stdout with timestamps.
+- Right column: stderr with timestamps.
+- `b` toggles stdin line-buffer mode (send on Enter) vs raw mode (each key is
+  forwarded immediately, like a terminal).
+- `x` toggles merging stdout/stderr into one chronological view.
+- `w` toggles word wrap for the stream panes (scroll uses visual rows).
+- `←`/`→` pan horizontally: files/env always; stdout/stderr/stdin when wrap is
+  off. Pane titles show `↑↓←→` when more content exists in that direction.
+- Vertical auto-follow only pins to the bottom after the output overflows the
+  pane; short output stays top-aligned.
+- `t` toggles auto-follow of the latest output.
+- `Esc` leaves stdin typing, or kills a running process; `q` quits the monitor.
+- stdin is closed automatically after the process exits.
+- `--stdin <path>` supplies input from a file and closes stdin at EOF; interactive
+  typing is disabled in this mode.
+
+IO logs preserve the original bytes, including line endings and non-UTF-8 output.
+The live view displays incomplete lines immediately and substitutes invalid UTF-8
+only for display. Quitting an active monitor saves the terminated process status.
+
+The session is still written under the record base (files, IO logs, and
+`execution.toml`), so it remains available in `recordit tui` afterwards.
 
 ## Tracing and Diagnostics
 

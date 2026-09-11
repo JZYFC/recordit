@@ -72,6 +72,15 @@ pub(crate) struct TuiArgs {
     /// Base directory that stores recordings. Default to .recordit in the git repository root or current working directory.
     #[arg(long, default_value_os_t = PathBuf::from(".recordit"))]
     pub(crate) record_base: PathBuf,
+    /// Optional nested command. When omitted, opens the session browser.
+    #[command(subcommand)]
+    pub(crate) command: Option<TuiCommand>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TuiCommand {
+    /// Record files and run a command with live TUI monitoring.
+    Run(RunArgs),
 }
 
 pub(crate) struct Context {
@@ -106,7 +115,7 @@ fn init_tracing() {
         .init();
 }
 
-fn resolve_record_base(cwd: &Path, record_base: &Path, context: &mut Context) -> PathBuf {
+pub(crate) fn resolve_record_base(cwd: &Path, record_base: &Path, context: &mut Context) -> PathBuf {
     use git2;
 
     let repo = git2::Repository::discover(cwd).ok();
@@ -145,7 +154,7 @@ fn resolve_record_base(cwd: &Path, record_base: &Path, context: &mut Context) ->
     base_dir
 }
 
-async fn ensure_record_base(record_base: &Path) -> Result<()> {
+pub(crate) async fn ensure_record_base(record_base: &Path) -> Result<()> {
     match async_fs::metadata(record_base).await {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -221,7 +230,10 @@ async fn handle_run(mut args: RunArgs) -> Result<()> {
 }
 
 async fn handle_tui(args: TuiArgs) -> Result<()> {
-    tui::run_tui(&args)
+    match args.command {
+        Some(TuiCommand::Run(run_args)) => tui::run_command(run_args).await,
+        None => tui::run_browser(args.cwd, args.record_base).await,
+    }
 }
 
 async fn handle_clean(args: CleanArgs) -> Result<()> {

@@ -6,10 +6,10 @@ use tracing::warn;
 
 use sysinfo::{Pid, Process, System};
 
-pub(super) struct ShellInvocation {
-    pub(super) program: OsString,
-    pub(super) args: Vec<OsString>,
-    pub(super) description: String,
+pub(crate) struct ShellInvocation {
+    pub(crate) program: OsString,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) description: String,
 }
 
 #[derive(Clone, Debug)]
@@ -25,7 +25,7 @@ pub(super) enum ShellKind {
     Cmd,
 }
 
-pub(super) fn prepare_shell_invocation(command: &[String]) -> Result<Option<ShellInvocation>> {
+pub(crate) fn prepare_shell_invocation(command: &[String]) -> Result<Option<ShellInvocation>> {
     let Some(shell) = detect_user_shell()? else {
         return Ok(None);
     };
