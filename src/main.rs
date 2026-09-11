@@ -6,6 +6,7 @@ use tokio::fs as async_fs;
 
 mod executor;
 mod recorder;
+mod tui;
 
 #[derive(Parser)]
 #[command(author, version, about, propagate_version = true)]
@@ -20,6 +21,8 @@ enum Commands {
     Run(RunArgs),
     /// Remove recorded sessions.
     Clean(CleanArgs),
+    /// Browse recorded sessions in an interactive TUI.
+    Tui(TuiArgs),
 }
 
 #[derive(clap::Args)]
@@ -53,6 +56,16 @@ pub(crate) struct RunArgs {
 
 #[derive(clap::Args)]
 pub(crate) struct CleanArgs {
+    /// Current working directory. Default to current working directory.
+    #[arg(long, default_value_os_t = std::env::current_dir().unwrap())]
+    pub(crate) cwd: PathBuf,
+    /// Base directory that stores recordings. Default to .recordit in the git repository root or current working directory.
+    #[arg(long, default_value_os_t = PathBuf::from(".recordit"))]
+    pub(crate) record_base: PathBuf,
+}
+
+#[derive(clap::Args)]
+pub(crate) struct TuiArgs {
     /// Current working directory. Default to current working directory.
     #[arg(long, default_value_os_t = std::env::current_dir().unwrap())]
     pub(crate) cwd: PathBuf,
@@ -207,6 +220,10 @@ async fn handle_run(mut args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+async fn handle_tui(args: TuiArgs) -> Result<()> {
+    tui::run_tui(&args)
+}
+
 async fn handle_clean(args: CleanArgs) -> Result<()> {
     let mut context = Context {
         git_root: None,
@@ -279,13 +296,17 @@ async fn handle_clean(args: CleanArgs) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+
+    // Keep the terminal clean for the interactive UI.
+    if !matches!(cli.command, Commands::Tui(_)) {
+        init_tracing();
+    }
 
     match cli.command {
         Commands::Run(args) => handle_run(args).await,
         Commands::Clean(args) => handle_clean(args).await,
+        Commands::Tui(args) => handle_tui(args).await,
     }
 }
 

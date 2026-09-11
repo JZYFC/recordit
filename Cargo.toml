@@ -1,6 +1,6 @@
 [package]
 name = "recordit"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 toml = "1"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time", "signal"] }
 sysinfo = "0.39"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

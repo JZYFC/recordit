@@ -103,6 +103,17 @@ recordit clean [--cwd <path>] [--record-base <path>]
 Deletes every entry inside the resolved recording directory. If nothing exists,
 the command is a no-op.
 
+### `recordit tui`
+
+```
+recordit tui [--cwd <path>] [--record-base <path>]
+```
+
+Opens an interactive terminal UI for browsing recorded sessions. The left pane
+lists sessions (newest first) with status and command; the right pane shows
+overview metadata plus recorded files, stdout, stderr, and stdin. Use `j`/`k`
+to move, `Tab` to switch panes, `1`-`5` to jump to a tab, and `q` to quit.
+
 ## Tracing and Diagnostics
 
 RecordIt uses `tracing` for diagnostics. Set `RUST_LOG` to control verbosity:
